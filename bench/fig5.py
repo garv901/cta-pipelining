@@ -1,4 +1,4 @@
-# Run: timeout 3000 env CUDA_VISIBLE_DEVICES=3,0 python3 -u bench/fig5.py   (torch dev 0 = physical GPU 3 = A, dev 1 = physical GPU 0 = B)
+# Run: timeout 3000 env CUDA_VISIBLE_DEVICES=<A>,<B> python3 -u bench/fig5.py   (torch dev 0 = producer GPU A, dev 1 = consumer GPU B; see scripts/pick_gpus.sh)
 import os, subprocess, sys, time, csv, gc
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
@@ -6,7 +6,8 @@ from ctapp.ext import ROOT
 from ctapp.timing import measure
 from ctapp.methods import *
 
-UUIDS = ["GPU-e82ab913-2d6b-1a55-89a8-9ad23a5a09cf", "GPU-cfd9ce0a-b7af-895a-f54c-4f175b610977"]  # physical GPU 0 (B) and 3 (A)
+UUIDS = (lambda m: [m[i] for i in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if i in m])(dict(  # physical GPUs in use
+    l.split(", ") for l in subprocess.run("nvidia-smi --query-gpu=index,uuid --format=csv,noheader", shell=True, capture_output=True, text=True).stdout.splitlines()))
 def smi():
     a = subprocess.run("nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv", shell=True, capture_output=True, text=True).stdout
     b = subprocess.run("nvidia-smi --query-gpu=index,uuid,utilization.gpu,memory.used --format=csv", shell=True, capture_output=True, text=True).stdout
