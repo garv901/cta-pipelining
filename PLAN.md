@@ -19,7 +19,7 @@ Implementation is done by Sonnet subagents. Opus is used only for Phase 3.
   - Weights are stored N×K (torch `Linear` layout), so both GEMMs are TN (K-major) GEMMs.
   - BF16 in and out, FP32 accumulate, no activation between the GEMMs.
   - M ∈ {1024, 2048, 4096, 8192, 16384, 32768}.
-- **GPU pair for 2-GPU runs:** producer = GPU 3, consumer = GPU 0. Check `nvidia-smi` before every run, record its output next to each result, and never run on GPUs 1 or 2 while other users' jobs are on them.
+- **GPU pair for 2-GPU runs:** pick whichever GPUs are free at run time (any of 0–3; all pairs are NV6). Phases 0–2c used producer = GPU 3, consumer = GPU 0. Check `nvidia-smi` before every run, record it and the physical pair next to each result, and re-measure P2P bandwidth when the pair changes.
 - **Toolchain:** `/usr/local/cuda-12.8`, matching torch 2.9.1+cu128. CUTLASS lives in `third_party/cutlass` and is never edited.
 - **Cluster shape:** 1×1×1. Tile IDs are handed out dynamically, so CTAs in a cluster would get unrelated tiles and TMA multicast would break.
 
@@ -179,17 +179,40 @@ Our kernel copies `KernelTma::operator()` from `sm90_gemm_tma.hpp` into `csrc/`.
 - **End-to-end:** small gains, −17 µs at M=1024, −40 to −77 µs at 2k–4k, −43 to −108 µs at ≥ 8k. Row-panel stays the default.
 - **Standing (µs):** CTAPP 476 / 786 / 1415 / 2433 / 4519 / 8668 for M = 1k → 32k. It beats TP2 by 8–15% from M=8192 up, and loses to micro-batching at every M.
 
-## Phase 3: SM90 cooperative persistent kernel (Opus, ~1 day)
-Priorities, from the 2b/2c diagnosis:
-1. **Overlap the remote-store drain** with the next tile's mainloop. A persistent kernel keeps computing while the previous tile's stores fly; signal only after the stores are complete (TMA store + `tma_store_wait<0>` / `cp.async.bulk.wait_group`, or a fence by the storing threads, then signal).
-2. **Close the kernel gap to cuBLAS.** KernelTma is 0.65x cuBLAS; the cooperative kernel with 2 consumer warpgroups and a TMA-store epilogue should be much closer. Measure 1-GPU speed first.
-3. **Tile order that completes rows one at a time** to shrink the tail (~one consumer wave today).
-4. Row-panel scoreboard (already done in 2c; port as-is).
+## Phase 3: SM90 cooperative persistent kernel (in progress)
+Full plan: ~/.claude/plans/iterative-orbiting-graham.md. Performance first; the bit-exact suite (3.4) runs once the implementation is stable.
 
-Design:
-- The producer warp (TMA-load warp) pops each tile ID from the source queue, polls for it, and hands it to the consumer warpgroups through a small shared-memory pipeline. This replaces the static scheduler.
-- Consumer warpgroups signal after each tile's store completes.
-- Same bit-exact tests, then rerun Phase 2's table.
+**Goals:**
+- G1: coop kernel ≥ 0.90x cuBLAS on 1 GPU at M ≥ 4k.
+- G2: producer span with protocol within ~5% of the standalone coop kernel writing to peer D (drain hidden).
+- G3: beat TP2 at every M (≥ 25% at M ≥ 8k); beat cuBLAS MB at M ≤ 4k (≥ 10% at 1k–2k); parity at M ≥ 16k is expected.
+- G4: tail ≤ ~1 consumer tile time.
+
+**Design:** the CUTLASS kernel stays untouched; both hooks are template parameters.
+- `CtappScheduler` (`csrc/ctapp_sched_sm90.hpp`): uses the cooperative kernel's dynamic-persistent path with a custom SM90 scheduler. Warp1 pops and polls the queue (instead of the CLC query) and writes the tile ID into the scheduler smem pipeline. `fetch_next_work` adds `fence.proxy.async.global`. `head` is pre-seeded to gridDim.x, so every role reads the first tile itself.
+- `CtappEpilogue<Base>` (`csrc/ctapp_epi_sm90.hpp`): wraps the TMA warp-specialized epilogue. The storing warp (warp 8) runs non-`.read` `cp.async.bulk.wait_group 0` on all lanes, then `fence.proxy.async.global` + `fence.acq_rel.sys`, then the row-panel signal. `signal_defer=1` signals tile i at the start of tile i+1's `store()`, so the drain overlaps the mainloop.
+- `csrc/gemm_coop.cu` is a second translation unit in the same extension. Python reuses `Pipeline` (`kernel="coop"`), `build_deps`, the order function and `measure()`.
+
+**3.0 result** (`results/coop_gate.md`, 2026-09-30):
+- **G1 passes.**
+  - The stock coop kernel runs at 0.90–1.07x cuBLAS in the event-timed sweep (670–700 TFLOP/s) and 0.985x in the gated check at M=16k; cuBLAS is noisy (±10%). `KernelTma` was 0.62–0.68x.
+  - Best config: 128x256 for M ≤ 8k, 256x128 from 16k. There are no spills.
+- **The peer-D gate fails.** Measured on pair 3→2, with link bandwidth 124.1 GB/s measured on that pair, peer/local is:
+
+  | M | 1k | 2k | 4k | 8k | 16k | 32k |
+  |---|---|---|---|---|---|---|
+  | peer/local | 1.71 | 1.52 | 1.42 | 1.22 | 1.24 | 1.26–1.28 |
+
+  - The link bound is always below local time, so the link bandwidth is not the limit.
+  - Diagnosis: the persistent CTAs run in lock-step, so all 132 epilogues burst ~8.6 MB at once. With the builder's StagesD = 2, the storing warp's `wait_group.read` holds both MMA warpgroups until the data has left over NVLink.
+  - Fix under test (3.0b): a full-tile smem D buffer (custom `Sm90TmaWarpSpecialized<…, StagesD = EpiTiles, …>` policy), so the drain overlaps the next mainloop.
+
+**Steps:**
+- 3.0 stock coop speed plus TMA store to peer (Sonnet).
+- 3.1 scheduler (Opus).
+- 3.2 epilogue signal and the 2-GPU pipeline (Opus).
+- 3.3 `fig5_coop` and `timeline_coop` (Sonnet).
+- 3.4 correctness (later).
 
 ## Phase 4: 4 GPUs, when GPUs 1 and 2 are free (~half day)
 1. A 4-layer chain with one GEMM per GPU (Table I, 4-GPU point), against micro-batching and TP4.

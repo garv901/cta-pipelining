@@ -11,7 +11,7 @@ def load():
     os.makedirs(f"{ROOT}/build/ext", exist_ok=True)
     return _load(
         name="gemm_tma_ext",
-        sources=[f"{ROOT}/csrc/gemm_tma.cu"],
+        sources=[f"{ROOT}/csrc/gemm_tma.cu", f"{ROOT}/csrc/gemm_coop.cu"],
         extra_include_paths=[f"{ROOT}/csrc", f"{ROOT}/third_party/cutlass/include", f"{ROOT}/third_party/cutlass/tools/util/include"],
         extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-DNDEBUG"],
         extra_cflags=["-O3", "-std=c++17"],

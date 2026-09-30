@@ -247,8 +247,10 @@ void pingpong(at::Tensor mine, at::Tensor other, at::Tensor out, int64_t n, int6
                                                                reinterpret_cast<unsigned long long*>(out.data_ptr<int64_t>()), (int)n, (int)is_a);
 }
 
+void register_coop(pybind11::module& m);  // gemm_coop.cu
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  register_coop(m);
   m.def("gemm_tma", &gemm_tma);
   m.def("ctapp_gemm", &ctapp_gemm, py::arg("X"), py::arg("W"), py::arg("Y"), py::arg("config_id"), py::arg("src_entries"), py::arg("src_head"),
         py::arg("src_tail"), py::arg("dep_offsets"), py::arg("dep_consumers"), py::arg("scoreboard"), py::arg("dst_entries"), py::arg("dst_head"),
