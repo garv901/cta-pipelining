@@ -43,6 +43,7 @@ struct CtappGemmKernel : BaseKernel {
       CollectiveMainloop::prefetch_tma_descriptors(params.base.mainloop);
     }
 
+    ctapp_stamp(params.ctapp, 0);  // CTAPP CHANGE 0: kernel entry stamp (before the prologue)
     // CTAPP CHANGE 1: claim a tile from the workqueue (blocks until its inputs are ready).
     int tile = ctapp_prologue(params.ctapp, reinterpret_cast<int*>(smem_buf + BaseKernel::SharedStorageSize));
 
@@ -101,6 +102,9 @@ struct CtappGemmKernel : BaseKernel {
       params.base.mainloop
     );
 
+    if (params.ctapp.stamps) __syncthreads();  // whole CTA finished the mainloop
+    ctapp_stamp(params.ctapp, 2);
+
     constexpr int BLK_M_RANK = cute::rank<0>(blk_shape);
     auto m_max_coord = unwrap(cute::transform(make_seq<BLK_M_RANK>{}, [&](auto i) {
         return  get<0,i>(problem_shape_MNKL) - get<0,i>(blk_shape) * get<0,i>(output_tile_coord);
@@ -125,8 +129,13 @@ struct CtappGemmKernel : BaseKernel {
       smem_buf
     );
 
+    if (params.ctapp.stamps) __syncthreads();  // whole CTA finished the epilogue stores
+    ctapp_stamp(params.ctapp, 3);
+
     // CTAPP CHANGE 3: signal dependent consumer tiles.
     if (params.ctapp.dep_offsets) ctapp_epilogue(params.ctapp, tile);
+    if (params.ctapp.stamps) __syncthreads();  // all signalling threads done
+    ctapp_stamp(params.ctapp, 4);
 #endif
   }
 };

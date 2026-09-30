@@ -137,15 +137,16 @@ void ctapp_gemm(at::Tensor X, at::Tensor W, at::Tensor Y, int64_t config_id,
                 at::Tensor src_entries, at::Tensor src_head, at::Tensor src_tail,
                 c10::optional<at::Tensor> dep_offsets, c10::optional<at::Tensor> dep_consumers, c10::optional<at::Tensor> scoreboard,
                 c10::optional<at::Tensor> dst_entries, c10::optional<at::Tensor> dst_head, c10::optional<at::Tensor> dst_tail,
-                int64_t tiles_n, int64_t skip_wait, int64_t fence) {
+                int64_t tiles_n, int64_t skip_wait, int64_t fence, c10::optional<at::Tensor> stamps, int64_t tiles_n2, int64_t rowpanel) {
   c10::cuda::CUDAGuard guard(X.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   auto ip = [](const c10::optional<at::Tensor>& t) { return t ? t->data_ptr<int>() : nullptr; };
   CtappParams p{
+      stamps ? reinterpret_cast<unsigned long long*>(stamps->data_ptr<int64_t>()) : nullptr,
       {src_entries.data_ptr<int>(), src_head.data_ptr<int>(), src_tail.data_ptr<int>(), (int)src_entries.numel()},
       ip(dep_offsets), ip(dep_consumers), ip(scoreboard),
       {ip(dst_entries), ip(dst_head), ip(dst_tail), dst_entries ? (int)dst_entries->numel() : 1},
-      (int)tiles_n, (int)skip_wait, (int)fence};
+      (int)tiles_n, (int)skip_wait, (int)tiles_n2, (int)rowpanel, (int)fence};
 #define RUN(...) __VA_ARGS__::run_ctapp(X, W, Y, p, stream)
   switch (config_id) { FOR_CONFIGS(RUN) default: TORCH_CHECK(false, "bad config_id"); }
 #undef RUN
@@ -206,9 +207,55 @@ void peer_copy(at::Tensor dst, at::Tensor src) {
   C10_CUDA_CHECK(cudaMemcpyPeerAsync(dst.data_ptr(), dst.get_device(), src.data_ptr(), src.get_device(), src.nbytes(), at::cuda::getCurrentCUDAStream()));
 }
 
+// ---- %globaltimer helpers for bench/timeline.py ----
+__device__ __forceinline__ unsigned long long gtimer() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
+
+// out[0] = globaltimer when this 1-thread kernel runs; enqueue it right after the gate wait.
+__global__ void stamp_kernel(unsigned long long* out) { *out = gtimer(); }
+void stamp_now(at::Tensor out) {
+  c10::cuda::CUDAGuard guard(out.device());
+  stamp_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(reinterpret_cast<unsigned long long*>(out.data_ptr<int64_t>()));
+}
+
+// out[i] = n consecutive globaltimer reads (tick resolution).
+__global__ void timer_reads_kernel(unsigned long long* out, int n) { for (int i = 0; i < n; i++) out[i] = gtimer(); }
+void timer_reads(at::Tensor out) {
+  c10::cuda::CUDAGuard guard(out.device());
+  timer_reads_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(reinterpret_cast<unsigned long long*>(out.data_ptr<int64_t>()), (int)out.numel());
+}
+
+// Ping-pong between two GPUs. mine: int flag local to this GPU; other: flag in the peer GPU's memory (UVA).
+// A (is_a): t1 = timer; other = i; spin mine == i; t2 = timer -> out[2i], out[2i+1].  B: spin mine == i; t = timer; other = i -> out[i].
+__global__ void pingpong_kernel(int* mine, int* other, unsigned long long* out, int n, int is_a) {
+  cuda::atomic_ref<int, cuda::thread_scope_system> fm(*mine), fo(*other);
+  for (int i = 1; i <= n; i++) {
+    if (is_a) {
+      unsigned long long t1 = gtimer();
+      fo.store(i, cuda::memory_order_release);
+      while (fm.load(cuda::memory_order_acquire) != i) {}
+      out[2 * (i - 1)] = t1; out[2 * (i - 1) + 1] = gtimer();
+    } else {
+      while (fm.load(cuda::memory_order_acquire) != i) {}
+      out[i - 1] = gtimer();
+      fo.store(i, cuda::memory_order_release);
+    }
+  }
+}
+void pingpong(at::Tensor mine, at::Tensor other, at::Tensor out, int64_t n, int64_t is_a) {
+  c10::cuda::CUDAGuard guard(mine.device());
+  pingpong_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(mine.data_ptr<int>(), other.data_ptr<int>(),
+                                                               reinterpret_cast<unsigned long long*>(out.data_ptr<int64_t>()), (int)n, (int)is_a);
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm_tma", &gemm_tma);
-  m.def("ctapp_gemm", &ctapp_gemm);
+  m.def("ctapp_gemm", &ctapp_gemm, py::arg("X"), py::arg("W"), py::arg("Y"), py::arg("config_id"), py::arg("src_entries"), py::arg("src_head"),
+        py::arg("src_tail"), py::arg("dep_offsets"), py::arg("dep_consumers"), py::arg("scoreboard"), py::arg("dst_entries"), py::arg("dst_head"),
+        py::arg("dst_tail"), py::arg("tiles_n"), py::arg("skip_wait"), py::arg("fence"), py::arg("stamps") = py::none(), py::arg("tiles_n2") = 0, py::arg("rowpanel") = 0);
+  m.def("stamp_now", &stamp_now);
+  m.def("timer_reads", &timer_reads);
+  m.def("pingpong", &pingpong);
   m.def("config_info", &config_info);
   m.def("occupancy", &occupancy);
   m.def("enable_peer_access", &enable_peer_access);

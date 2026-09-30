@@ -51,6 +51,12 @@ for M, c1, c2, runs, kw in [(4096, CFG64, CFG64, 50, dict(fence=1)), (4096, CFG1
                             (16384, CFG64_2CTA, CFG64_2CTA, 20, dict(fence=1, group_rows=8)), (16384, CFG128_2CTA, CFG128_2CTA, 20, dict(fence=0, group_rows=8))]:
     case(M, c1, c2, runs, **kw)
 
+# Phase 2c: row-panel scoreboard (Pipeline default); explicit scoreboard="tile" keeps the old path
+for M, c1, c2, runs, kw in [(M, c, c, 50 if M < 16384 else 20, dict(fence=1, group_rows=g)) for M in (1024, 4096, 16384) for c, g in ((CFG128_2CTA, 1), (CFG128_2CTA, 8), (CFG64, 1))] + \
+                            [(4096, CFG128_2CTA, CFG64_2CTA, 50, dict(fence=1)), (4096, CFG128_2CTA, CFG64_2CTA, 50, dict(fence=1, group_rows=8)),
+                             (4096, CFG128_2CTA, CFG128_2CTA, 50, dict(fence=1, group_rows=8, scoreboard="tile"))]:
+    case(M, c1, c2, runs, **kw)
+
 # negative controls (skip_wait): default config, and the chosen best variant (fence F1, grouped order, 2 CTAs/SM)
 for cfg, kw in [(CFG64, {}), (CFG128_2CTA, dict(fence=1, group_rows=8))]:
   M = 16384

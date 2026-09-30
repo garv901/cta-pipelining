@@ -96,8 +96,8 @@ class TensorParallel2(Base):
 
 
 class Ctapp(Base):
-    def __init__(self, M, X, W1, W2, cfg_p, cfg_c, group_rows, fence=1):
-        self.pl = Pipeline(M, N, K, cfg_p, cfg_c, devA=0, devB=1, fence=fence, group_rows=group_rows)
+    def __init__(self, M, X, W1, W2, cfg_p, cfg_c, group_rows, fence=1, scoreboard="rowpanel"):
+        self.pl = Pipeline(M, N, K, cfg_p, cfg_c, devA=0, devB=1, fence=fence, group_rows=group_rows, scoreboard=scoreboard)
         self.X, self.W1, self.W2 = X, W1, W2
 
     def prepare(self): self.pl.reset()
@@ -106,7 +106,7 @@ class Ctapp(Base):
         pl = self.pl
         with torch.cuda.device(0):
             pl.ext.ctapp_gemm(self.X, self.W1, pl.Y1, pl.cfg1, pl.src_a, pl.head_a, pl.tail_a, pl.dep_off, pl.dep_cons, pl.sb, pl.src_b,
-                              pl.head_b, pl.tail_b, pl.tn1, 0, pl.fence)
+                              pl.head_b, pl.tail_b, pl.tn1, 0, pl.fence, tiles_n2=pl.tn2, rowpanel=pl.rowpanel)
         with torch.cuda.device(1):
             pl.ext.ctapp_gemm(pl.Y1, self.W2, pl.Y2, pl.cfg2, pl.src_b, pl.head_b, pl.tail_b, None, None, None, None, None, None, pl.tn2, 0, 0)
 

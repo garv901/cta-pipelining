@@ -67,7 +67,7 @@ for M in [4096, 16384]:
                     sg = f >= 0
                     ts[f] = bench(lambda: ext.ctapp_gemm(X, W1, pl.Y1, c, pl.src_a, pl.head_a, pl.tail_a, pl.dep_off if sg else None, pl.dep_cons if sg else None,
                                                          pl.sb if sg else None, pl.src_b if sg else None, pl.head_b if sg else None, pl.tail_b if sg else None,
-                                                         pl.tn1, 0, max(f, 0)), pre=sig)
+                                                         pl.tn1, 0, max(f, 0), tiles_n2=pl.tn2, rowpanel=pl.rowpanel), pre=sig)
             rows2.append([M, label, oname, f"{ts[-1]:.0f}"] + sum([[f"{ts[f]:.0f}", f"{(ts[f]-tp)/waves:.1f}", f"{(ts[f]-ts[-1])/waves:.1f}"] for f in FENCES], []))
 p("## Producer alone, no protocol")
 table(["M", "cfg", "waves", "local D us", "TFLOP/s", "peer D us", "TFLOP/s"], rows1)

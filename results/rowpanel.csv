@@ -1,0 +1,93 @@
+M,method,variant,median_us,p10_us,p90_us
+1024,OneGpuCublas,,355.7,354.5,356.5
+1024,MicroBatchCublas,chunk=256,336.1,326.7,337.1
+1024,MicroBatchCublas,chunk=512,367.5,360.0,376.3
+1024,MicroBatchCublas,chunk=1024,507.3,498.5,508.2
+1024,TensorParallel2,,368.4,367.5,372.1
+1024,Ctapp,cfg7/7 group8 tile,593.2,582.1,605.3
+1024,Ctapp,cfg7/7 group8 rowpanel,576.6,570.7,588.2
+1024,Ctapp,cfg7/7 group1 tile,493.3,488.4,496.1
+1024,Ctapp,cfg7/7 group1 rowpanel,476.3,468.6,478.2
+1024,Ctapp,cfg4/4 group8 tile,594.5,580.5,618.9
+1024,Ctapp,cfg4/4 group8 rowpanel,605.2,592.8,628.0
+1024,Ctapp,cfg6/6 group8 tile,565.1,557.8,568.7
+1024,Ctapp,cfg6/6 group8 rowpanel,566.5,560.8,572.7
+2048,OneGpuCublas,,692.7,691.5,694.0
+2048,MicroBatchCublas,chunk=256,566.3,563.6,572.1
+2048,MicroBatchCublas,chunk=512,547.6,539.2,549.2
+2048,MicroBatchCublas,chunk=1024,683.0,681.4,683.8
+2048,MicroBatchCublas,chunk=2048,961.2,960.7,962.7
+2048,TensorParallel2,,700.3,699.5,703.1
+2048,Ctapp,cfg7/7 group8 tile,905.8,884.2,922.1
+2048,Ctapp,cfg7/7 group8 rowpanel,866.0,854.1,882.8
+2048,Ctapp,cfg7/7 group1 tile,839.3,828.2,854.6
+2048,Ctapp,cfg7/7 group1 rowpanel,786.2,777.0,794.0
+2048,Ctapp,cfg4/4 group8 tile,1148.4,1016.3,1204.3
+2048,Ctapp,cfg4/4 group8 rowpanel,1177.2,1098.2,1224.0
+2048,Ctapp,cfg6/6 group8 tile,909.9,903.9,918.4
+2048,Ctapp,cfg6/6 group8 rowpanel,916.5,908.8,927.5
+4096,OneGpuCublas,,1387.6,1373.1,1398.5
+4096,MicroBatchCublas,chunk=256,1031.5,1029.0,1037.3
+4096,MicroBatchCublas,chunk=512,907.9,904.9,916.1
+4096,MicroBatchCublas,chunk=1024,1019.5,1017.5,1028.4
+4096,MicroBatchCublas,chunk=2048,1304.3,1295.3,1305.9
+4096,MicroBatchCublas,chunk=4096,1880.8,1879.7,1890.1
+4096,TensorParallel2,,1348.1,1345.4,1352.0
+4096,Ctapp,cfg7/7 group8 tile,1492.5,1430.1,1513.5
+4096,Ctapp,cfg7/7 group8 rowpanel,1415.3,1394.4,1435.7
+4096,Ctapp,cfg7/7 group1 tile,1455.1,1417.0,1490.4
+4096,Ctapp,cfg7/7 group1 rowpanel,1428.8,1413.5,1456.9
+4096,Ctapp,cfg4/4 group8 tile,2372.5,2228.1,2459.3
+4096,Ctapp,cfg4/4 group8 rowpanel,2417.9,2340.6,2554.6
+4096,Ctapp,cfg6/6 group8 tile,1637.0,1619.2,1665.8
+4096,Ctapp,cfg6/6 group8 rowpanel,1635.3,1616.0,1668.0
+8192,OneGpuCublas,,2795.6,2785.9,3020.6
+8192,MicroBatchCublas,chunk=256,1955.7,1948.4,1961.5
+8192,MicroBatchCublas,chunk=512,1625.6,1624.1,1641.8
+8192,MicroBatchCublas,chunk=1024,1721.3,1719.6,1728.0
+8192,MicroBatchCublas,chunk=2048,1991.9,1989.8,2001.3
+8192,MicroBatchCublas,chunk=4096,2568.5,2558.5,2570.1
+8192,MicroBatchCublas,chunk=8192,3805.8,3797.5,3806.9
+8192,TensorParallel2,,2648.6,2639.9,2654.2
+8192,Ctapp,cfg7/7 group8 tile,2475.6,2436.5,2515.6
+8192,Ctapp,cfg7/7 group8 rowpanel,2432.6,2416.0,2451.9
+8192,Ctapp,cfg7/7 group1 tile,2773.4,2723.9,2915.7
+8192,Ctapp,cfg7/7 group1 rowpanel,2688.2,2629.2,2874.7
+8192,Ctapp,cfg4/4 group8 tile,4974.1,4823.3,5118.8
+8192,Ctapp,cfg4/4 group8 rowpanel,5060.9,4943.4,5187.7
+8192,Ctapp,cfg6/6 group8 tile,3076.6,3041.6,3122.1
+8192,Ctapp,cfg6/6 group8 rowpanel,3068.5,3032.1,3143.5
+16384,OneGpuCublas,,6325.9,6086.0,6443.3
+16384,MicroBatchCublas,chunk=256,3817.5,3813.9,3825.2
+16384,MicroBatchCublas,chunk=512,3086.3,3082.8,3092.1
+16384,MicroBatchCublas,chunk=1024,3124.9,3119.6,3131.4
+16384,MicroBatchCublas,chunk=2048,3403.8,3391.0,3412.7
+16384,MicroBatchCublas,chunk=4096,3969.6,3960.6,3976.0
+16384,MicroBatchCublas,chunk=8192,5217.0,5209.7,5222.3
+16384,MicroBatchCublas,chunk=16384,7578.8,7573.3,7583.7
+16384,TensorParallel2,,5191.2,5169.0,5224.3
+16384,Ctapp,cfg7/7 group8 tile,4570.8,4530.0,4600.9
+16384,Ctapp,cfg7/7 group8 rowpanel,4519.3,4497.5,4541.2
+16384,Ctapp,cfg7/7 group1 tile,5799.7,5603.9,5998.6
+16384,Ctapp,cfg7/7 group1 rowpanel,5589.8,5292.3,5799.4
+16384,Ctapp,cfg4/4 group8 tile,10437.1,10343.9,10524.2
+16384,Ctapp,cfg4/4 group8 rowpanel,10502.5,10331.8,10618.8
+16384,Ctapp,cfg6/6 group8 tile,5872.3,5840.6,5987.0
+16384,Ctapp,cfg6/6 group8 rowpanel,5902.0,5818.4,6073.9
+32768,OneGpuCublas,,12767.6,12571.5,13020.7
+32768,MicroBatchCublas,chunk=256,7520.0,7512.4,7525.5
+32768,MicroBatchCublas,chunk=512,6022.7,6019.1,6030.8
+32768,MicroBatchCublas,chunk=1024,5959.3,5952.8,5967.5
+32768,MicroBatchCublas,chunk=2048,6287.9,6237.5,6337.7
+32768,MicroBatchCublas,chunk=4096,6883.4,6863.0,6919.2
+32768,MicroBatchCublas,chunk=8192,8091.7,8085.0,8104.4
+32768,MicroBatchCublas,chunk=32768,15161.0,15142.8,15177.6
+32768,TensorParallel2,,10199.7,10168.0,10247.6
+32768,Ctapp,cfg7/7 group8 tile,8776.3,8714.6,8821.1
+32768,Ctapp,cfg7/7 group8 rowpanel,8668.2,8626.3,8696.1
+32768,Ctapp,cfg7/7 group1 tile,11632.5,11456.2,11960.5
+32768,Ctapp,cfg7/7 group1 rowpanel,11766.8,11303.0,12419.7
+32768,Ctapp,cfg4/4 group8 tile,21345.6,21062.4,21601.3
+32768,Ctapp,cfg4/4 group8 rowpanel,21415.1,21133.5,21560.7
+32768,Ctapp,cfg6/6 group8 tile,11568.5,11411.9,11728.0
+32768,Ctapp,cfg6/6 group8 rowpanel,11700.5,11529.9,11859.0

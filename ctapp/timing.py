@@ -7,7 +7,7 @@ ext = load()
 ext.gate_alloc()
 
 
-def measure(method, reps=20, warmup=5, devs=(0, 1)):
+def measure(method, reps=20, warmup=5, devs=(0, 1), times=None):
     """method.prepare() runs before the gate; method.enqueue() is timed. Returns (median, p10, p90) in us. devs[0] is GPU A (timeline owner)."""
     streams = [torch.cuda.current_stream(d) for d in devs]
     # ungated run first: lazy CUDA module loading inside a gated window deadlocks (launch waits on the blocked stream)
@@ -30,5 +30,6 @@ def measure(method, reps=20, warmup=5, devs=(0, 1)):
         ext.gate_set(1)
         for d in devs: torch.cuda.synchronize(d)
         if i >= warmup: ts.append(start.elapsed_time(end) * 1e3)
+    if times is not None: times.extend(ts)  # per-rep latencies (us), for matching per-rep stamps
     q = statistics.quantiles(ts, n=10, method="inclusive")
     return statistics.median(ts), q[0], q[-1]

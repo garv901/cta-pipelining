@@ -160,11 +160,36 @@ Our kernel copies `KernelTma::operator()` from `sm90_gemm_tma.hpp` into `csrc/`.
 - Use this to find where the extra time goes at M=1024 and 4096. The candidates are consumer ramp, start skew between the GPUs, polling, and remote atomics.
 - Any overhead found here would carry into Phase 3 as well.
 
+**Phase 2b result** (`results/timeline.md`, `results/timeline_M1024.png`, `results/timeline_M4096.png`):
+- **Clocks and link:** globaltimer resolves 32 ns, and the NVLink flag round trip is 3.7 µs. The start skew between GPUs is under 5 µs, so it isn't a factor.
+- **Main cause: the producer is slowed by the protocol.** At M=1024 its span is 341 µs, against 232 µs for the same kernel with no protocol. Two parts:
+  - **(a) Signalling contention.** Each producer tile does 64 `fetch_sub` operations, and all 64 tiles of a row panel hit the same 64 counters. The signal phase takes 28–44 µs per CTA when many signal at once, against 4–8 µs when a CTA signals alone. The fence costs only 7–8 µs of that.
+  - **(b) Remote store burst.** At small M the waves run in lock-step, so each wave's 8.6 MB write drains while no CTA is computing. That costs about 50 µs at M=1024.
+- **Second cause: the tail.** The last producer wave completes about 4 row panels at once, which leaves one full consumer wave (114 µs at M=1024) after the producer finishes.
+- **Ruled out:** consumer slowdown from overlap (within ±5%), start skew, and the start-up delay. The consumer is starved, not backlogged.
+
+## Phase 2c: row-panel scoreboard (done)
+- One counter per consumer row panel instead of one per consumer tile, following the paper's own "row-to-row" simplification (Sec III.A).
+- The last producer tile of a row pushes all of that row's consumer tiles. Each counter sits on its own 128-byte line.
+- This cuts the atomics per producer tile from 64 to 1.
+
+**Phase 2c result** (`results/rowpanel.md`, `results/timeline.md` Phase 2c section):
+- **The Phase 2b prediction failed.** Per-CTA signal time barely moved (29.3 → 29.6 µs at M=1024, 18.2 → 15.0 µs at M=4096 g8), and the producer span did not shrink.
+- **Correction to Phase 2b (a):** the signal time is not counter contention. Weakening fences and atomics (`fence=2`, unsafe `fence=3`) only moves time between the store phase and the signal phase; their sum stays the same. The real cost is draining each wave's ~8.6 MB remote-store burst.
+- **End-to-end:** small gains, −17 µs at M=1024, −40 to −77 µs at 2k–4k, −43 to −108 µs at ≥ 8k. Row-panel stays the default.
+- **Standing (µs):** CTAPP 476 / 786 / 1415 / 2433 / 4519 / 8668 for M = 1k → 32k. It beats TP2 by 8–15% from M=8192 up, and loses to micro-batching at every M.
+
 ## Phase 3: SM90 cooperative persistent kernel (Opus, ~1 day)
-Port the same hooks into `sm90_gemm_tma_warpspecialized_cooperative.hpp`:
-- The TMA-load warp pops each tile ID from the queue and hands it to the consumer warpgroups through a small shared-memory pipeline. This replaces the static scheduler.
-- Consumer warpgroups signal after each tile's store completes, using the NoSmem epilogue first.
-- Same tests, then rerun Phase 2's table.
+Priorities, from the 2b/2c diagnosis:
+1. **Overlap the remote-store drain** with the next tile's mainloop. A persistent kernel keeps computing while the previous tile's stores fly; signal only after the stores are complete (TMA store + `tma_store_wait<0>` / `cp.async.bulk.wait_group`, or a fence by the storing threads, then signal).
+2. **Close the kernel gap to cuBLAS.** KernelTma is 0.65x cuBLAS; the cooperative kernel with 2 consumer warpgroups and a TMA-store epilogue should be much closer. Measure 1-GPU speed first.
+3. **Tile order that completes rows one at a time** to shrink the tail (~one consumer wave today).
+4. Row-panel scoreboard (already done in 2c; port as-is).
+
+Design:
+- The producer warp (TMA-load warp) pops each tile ID from the source queue, polls for it, and hands it to the consumer warpgroups through a small shared-memory pipeline. This replaces the static scheduler.
+- Consumer warpgroups signal after each tile's store completes.
+- Same bit-exact tests, then rerun Phase 2's table.
 
 ## Phase 4: 4 GPUs, when GPUs 1 and 2 are free (~half day)
 1. A 4-layer chain with one GEMM per GPU (Table I, 4-GPU point), against micro-batching and TP4.
