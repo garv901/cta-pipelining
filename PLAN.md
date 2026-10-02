@@ -220,3 +220,197 @@ Full plan: ~/.claude/plans/iterative-orbiting-graham.md. Performance first; the 
    - Pairs (0→1) and (2→3), weights sharded across the two pairs.
    - An NCCL AllReduce between the two consumer GPUs.
    - Compared against TP4 at M ∈ {4096, 8192, 16384}.
+
+## Step 0 (2026-10-01, node1): measure first — results and decision
+
+Run on Slurm node1 (8x H100 80GB HBM3, NVSwitch, NV18 between every pair; hold jobs 11248 (4 GPUs) and 11250 (2 GPUs),
+`srun --overlap`), torch 2.12.1+cu129, CUDA 12.9. Scripts: `bench/node1_link.py`, `bench/tp_strong.py` (+ `tp_strong_report.py`),
+`bench/fig5.py --shape/--methods`. Full tables: `results/node1_link.md`, `results/tp_strong.md`, `results/fig5_node1.md`.
+
+**S0.1 link.** SM-store P2P 369 GB/s per GPU egress to any peer and the *same* 368 GB/s aggregate when fanning out to 2 or 3
+peers (egress-capped, not per-link); copy engine 392 GB/s; flag round trip 4.5 us; NVLS multicast supported on all GPUs.
+Last-wave drain floor 23 us (was 69 at 124 GB/s). Stock coop cfg0 with D in peer memory: 1.20/1.14/1.02x local at M=1k/4k/16k,
+bit-equal. Fixed-cost model, paper shape: CTAPP/ideal 1.32/1.16/1.08/1.04/1.02 at M=1k..16k. 70B FFN per-tile-reduce link
+ratio 0.07 (TP2) / 0.20 (TP4) / 0.46 (TP8).
+
+**S0.2 strong TP (back-to-back, best variant, exposed = share of the step above 1-GPU/world).**
+
+| shape | TP | M=1k | 2k | 4k | 8k | 16k | best variant (typ.) |
+|---|---|---|---|---|---|---|---|
+| 70B FFN up->down | 2 | 6 % | 1 % | 4 % | 2 % | 4 % | asynctp |
+| 70B FFN up->down | 4 | 16 % | 0 % | 2 % | 6 % | 10 % | asynctp (multimem at 1k) |
+| 70B down->norm->QKV | 2 | 18 % | 12 % | 11 % | 8 % | 9 % | asynctp |
+| 70B down->norm->QKV | 4 | 45 % | 42 % | 22 % | 18 % | 17 % | multimem at <=2k, asynctp above |
+| paper 8192 square | 2 | 24 % | 10 % | 5 % | 5 % | 9 % | asynctp |
+| paper 8192 square | 4 | 49 % | 46 % | 31 % | 17 % | 31 % | multimem / asynctp |
+
+Plain NCCL all-reduce exposes 10-16 % (FFN TP2/TP4), 21-23 % (QKV TP2), 38-48 % (QKV TP4). `asynctp` = PyTorch
+fused_matmul_reduce_scatter (sharded output); on the QKV chain it needs a separate NCCL all-gather before the QKV GEMM, which is
+the un-overlapped part. (Outlier: l70b TP4 M=16k asynctp 21 ms, a queueing glitch also seen by the porting agent; asynctp_ag
+is used there.)
+
+**S0.3 recalibration.** Micro-batching (cuBLAS, best chunk) 1.82/1.43/1.26/1.10/0.99x ideal on the paper shape and 1.3-1.9x on
+the 70B shapes; TP2 with plain NCCL beats it everywhere except paper M=16k. The Phase-1 KernelTma CTAPP is 1.4-2.3x ideal
+(paper) / 2.0-2.9x (down->QKV) because the KernelTma kernels run at 0.68-0.74x cuBLAS and the pipeline is still 24 % slower
+than micro-batching the same kernel. Confirms: all further work sits on the cooperative kernel.
+
+**Decision (rule 1 of the Step-0 checkpoint, applied to the measured numbers).**
+- The 70B FFN is closed: strong TP2 and TP4 are within 0-6 % of ideal for M >= 2k. Role B on the FFN (per-tile reduce) cannot
+  pay for itself; drop it.
+- The 2-GPU pipeline-parallel comparison (paper Fig 5, role A) is against micro-batching, which strong TP2 already beats by
+  20-40 %; a CTAPP that reaches the model's 1.08x at M=4k would merely tie asynctp (1.12x on the QKV chain). Not worth the
+  scheduler/epilogue work on its own; keep only as a by-product.
+- **Target: Llama-70B down-proj -> RMSNorm -> QKV at TP4** (8192-wide crossing between a 28672-deep GEMM and a 10240-wide one).
+  Strong baseline exposes 17-22 % at M = 4k-16k (asynctp) and 42-45 % at M <= 2k (multimem). Mechanism ("Phase 4"): the
+  down-proj epilogue reduces each 128x256 partial tile across the 4 ranks with `multimem.red.add` into a multicast buffer
+  (replicated output, P bytes egress per GPU, link ratio 0.27 at 369 GB/s), one `multimem.red` counter per 128-row panel;
+  when a panel is complete on a GPU it is RMS-normed and pushed into that GPU's QKV-GEMM workqueue (existing row-panel
+  scoreboard/queue protocol), so the all-gather disappears and the QKV GEMM starts ~1 us after the first panel lands instead
+  of after the full reduce + norm + all-gather. Fixed costs: 128-row fill of the down-proj (2*128*28672*8192/4/700T = 21 us
+  per GPU), drain 23 us, protocol ~15 us, against a 1k-token ideal of 242 us: model 1.24x at M=1k (multimem 1.82x), 1.06x at
+  4k (asynctp 1.28x), 1.03x at 8k (asynctp 1.22x). TP2 bring-up rung uses the same code with peer stores instead of multimem.
+- Gate for Phase 4: beat asynctp at M = 4k and 8k by >= 10 % and multimem at M = 1k-2k by >= 20 %, bit-exact vs a reference
+  reduce (bf16 multimem accumulation order permitting; else rel err <= the NVLS baseline's).
+
+## Phase 4 (2026-10-02): TP4 down-proj -> RMSNorm -> QKV with a CTA-pipelined NVLS reduction — design
+
+### What problem the kernel addresses (why the QKV chain has a gap and the FFN does not)
+
+The gap is not "communication is slow" but "communication sits in a dependency chain nobody overlaps". With Megatron sharding
+the down-proj is K-sharded, so every GPU holds a partial sum of the full output, and the next operations need the complete sum
+on every GPU twice over: RMSNorm needs each row's full sum of squares, the N-sharded QKV GEMM needs the full normalised
+activation as its A operand, and the residual stream must be complete everywhere for the next layer. Dependency:
+partial-sum -> full-sum replicated -> norm -> GEMM.
+
+- FFN (up-proj -> SwiGLU -> down-proj): SwiGLU is elementwise and row-local, so a reduce-scatter that leaves each GPU a quarter
+  of the rows is enough and the following all-gather fuses into the next GEMM's loads. Async-TP does exactly that and measured
+  0-6 % from ideal (Step 0). Nothing left to recover; path closed.
+- QKV chain: both strong baselines pay a serialised stretch. Async-TP overlaps the reduce-scatter with the down-proj, then runs
+  the norm on its row quarter, then an all-gather with nothing to hide behind, then the QKV GEMM: the all-gather and the norm are
+  exposed. The in-switch multimem all-reduce has no overlap at all: a separate kernel between the GEMMs plus a separate residual
+  add and norm. Measured at M=4096/TP4: the two GEMMs alone take 0.92 ms; async-TP 1.27 ms, multimem 1.65 ms. The exposed
+  0.35-0.73 ms is the target (17-45 % of the step depending on M).
+
+What the kernel does differently: the reduction becomes a per-tile stream that runs during the producing GEMM. As each 128x256
+partial tile lands, a small reducer on reserved SMs pulls the fp32 sum through the switch (multimem.ld_reduce), adds the
+residual, broadcasts the finished rows to every GPU (multimem.st), and accumulates the per-row sum of squares. When the down-proj
+finishes, the replicated residual stream and the norm statistics already exist everywhere: the all-gather disappears because the
+output was broadcast as it was produced, and the norm disappears as a pass because the QKV epilogue scales rows by the
+statistic with gamma folded into the weights. The only exposed work is the last wave's reduction and the SMs lent to the reducer.
+Gains so far: 1.06 vs 1.27 ms (async-TP) at M=4096; 0.36 vs 0.44 ms (multimem) at M=1024; the distance to the 0.92 ms floor is
+mostly the 16 reducer SMs, which the current sweep tries to cut to 6-8.
+
+Scope caveat: this pays only where the consumer of a reduction needs replicated rows, i.e. the attention-side boundary of every
+transformer layer (once per layer). It is one boundary, not a general replacement for tensor-parallel collectives.
+
+Production constraints: one process per GPU (torch.distributed, NCCL group for setup only), symmetric memory via
+`torch.distributed._symmetric_memory` (multicast pointers), no host sync inside a forward, counters monotonic across forwards
+(epoch-scaled targets, never reset), gamma folded into W_qkv, residual add fused into the reduction, every GPU ends with the
+full reduced residual stream `x` (replicated, like the all-reduce it replaces).
+
+Files: `csrc/ctapp_tp4.cuh` (protocol hooks), `scripts/gen_coop_ctapp.py` -> `csrc/sm90_gemm_coop_ctapp.hpp` (stock CUTLASS 4.8
+cooperative kernel with 5 splice points), `csrc/gemm_tp4.cu` (two kernels + multimem probes, module `ctapp_tp4_ext`),
+`ctapp/ext.py::load_tp4`, `ctapp/tp4.py` (per-rank boundary class + baselines), `tests/test_tp4.py`, `bench/tp4_bench.py`.
+
+Kernel 1, down-proj (K-sharded, 128x256x64 cooperative, identical persistent grid and tile order on every rank). After a CTA's
+TMA store of partial tile (m, n) lands (`cp.async.bulk.wait_group 0` + `fence.proxy.async` on the issuing warp, named barrier,
+`fence.acq_rel.sys`), thread 0 does `multimem.red.release.add` on `tile_cnt[m*tn+n]` (multicast, so every rank's copy counts
+all ranks). It then reduces ITS RANK'S 32-row slice of the tile it stored one step earlier: spin on local
+`tile_cnt >= epoch*world`, `multimem.ld_reduce.add.acc::f32.v4.bf16x2` over the 4 copies of `partials`, + residual,
+`multimem.st.v4.bf16x2` into every rank's `x`, per-row sum of squares via shuffle + `multimem.red.add.f32` into `rowss[parity]`,
+then `multimem.red.release.add` on `panel_cnt[m]`. The one-tile deferral means the wait is normally already satisfied (the
+other ranks stored the same tile in the same wave); deadlock-free by induction because a wait at step k only depends on
+stores at step k-1 of a grid that is identical on every rank. The last tile is reduced after the work loop. No separate
+reducer kernel: the cooperative kernel occupies all 132 SMs.
+
+Kernel 2, QKV (N-sharded, same tile config, RMS epilogue). The TMA-load warp spins on local `panel_cnt[m] >= epoch*tn*world`
+before loading the A tiles of row panel m (then `fence.proxy.async.global` so the TMA reads see the multimem stores); the
+consumer warp groups acquire the same counter before the epilogue, whose EVT scales each row by `rsqrt(rowss[row]/8192 + 1e-5)`
+(`Sm90ColBroadcast` of rowss + `Sm90Compute<RmsScaleFn>` on the accumulator). Replicated A means no all-gather.
+
+Host per forward: `epoch += 1; rowss[epoch&1].zero_()` -> kernel 1 (mode 1) -> kernel 2 (mode 2), all on one stream; the
+two kernels overlap only through the counters (kernel 2 is queued behind kernel 1 on the stream, so on H100 it starts when
+kernel 1's CTAs retire — the overlap is the reduction + norm + all-gather, not the two GEMMs; see results for whether a second
+stream / PDL is needed).
+
+Correctness levers: fp32 accumulation inside the switch (`acc::f32`), rounding to bf16 once per element (same as NVLS
+all-reduce); rowss accumulated in fp32 from the bf16-rounded x (matches an eager RMSNorm on the bf16 residual stream).
+
+### Phase 4 bring-up log (2026-10-02, node1, TP4, M = 4096 unless noted; b2b ms, max over ranks)
+
+Correctness: first build passed the fp32 reference on 4 GPUs (x rel err 4.5e-3 = the multimem all-reduce baseline's own
+error, out 4.4e-3), 23 epochs back to back, 0 ordering violations in the multimem stress probe, mode-0 GEMM bit-exact vs cuBLAS.
+
+Measured primitives (probes in `gemm_tp4.cu`): SM-issued multimem throughput is capped at **~90 GB/s per GPU** for every op
+type (ld_reduce 88, multicast st 93, red.add bf16x2 84, with all 4 ranks active; a local copy runs at 1.4 TB/s). Latency:
+dependent ld_reduce chain 1.4 us, multicast st + fence.acq_rel.sys 3.0 us, local ld.acquire.sys 0.15 us. Consequence: the
+reduction of P/4 = 16 MB per GPU costs 32 MB of multimem ops = 0.36 ms, i.e. 58 % of the 0.63 ms down-proj it must hide under.
+
+| variant | down-proj b2b | note |
+|---|---|---|
+| mode 0 (plain cooperative GEMM) | 0.63 | floor; cuBLAS 0.90 |
+| consumers signal only (no reduce) | 0.69 | store drain + fence + multimem.red per tile: +0.06 |
+| mode 3: reduce in the consumer warp groups, deferred one tile | 1.27 | MMA idles during the multimem round trips |
+| mode 1: reduce in the 2 idle producer warps (40-register budget) | 0.95 | **not hidden**: +0.32 = exactly the multimem time |
+| mode 1 ablations: no ld_reduce / no st / neither | 0.81 / 0.89 / 0.68 | each op type costs its own transfer time |
+| mode 1 with 4 instead of 2 x 16 B in flight per thread | 0.95 | not latency-bound |
+
+Two bring-up bugs worth remembering: (1) `NamedBarrier::sync(n, uint32_t id)` adds the 8 reserved ids, so passing
+`FirstUserBarrier` (= 8) wrapped to hardware barrier 0/1 and collided with `__syncthreads`/the epilogue barrier -> sporadic
+"illegal instruction"; user ids must be 0..7. (2) Changing the setmaxnreg split to 64/224 (sum exactly 65536) hangs the kernel
+even in mode 0; stock 40/232 kept, reducer path verified at <= 40 registers via a stand-alone probe kernel.
+
+Open question being measured (mode 4): a separate reducer kernel on R reserved SMs (GEMM launched with sm_count = 132 - R) —
+does multimem traffic from *other* SMs slow the GEMM, or only traffic issued from the GEMM's own SMs?
+
+Mode 4 answer (stand-alone reducer kernel on R reserved SMs, GEMM on 132 - R; b2b ms):
+
+| M | floor (2 GEMMs) | down on 116 SMs | down + reducer R=16 | chain (ours) | best baseline |
+|---|---|---|---|---|---|
+| 1024 | 0.237 | 0.219 | 0.271 | 0.355 | multimem 0.439 (-19 %) |
+| 4096 | 0.921 | 0.723 | 0.797 | 1.058 | asynctp 1.265 (-16 %) |
+| 8192 | 1.912 | 1.500 | 1.631 | 2.303 | asynctp 2.483 (-7 %) |
+
+So the reducer *does* overlap when it is not inside the GEMM's SMs; the remaining cost is (a) the 16 SMs taken from the GEMM
+(12 %), (b) ~10 % GEMM slowdown from the traffic landing in the GEMM GPU's memory system (probe with no-wait reducer), (c) the
+reducer's per-tile serialisation (R=8 -> 1.14, R=12 -> 0.91, R=16 -> 0.80 at M=4k: each block does spin, 2 x 16 B per thread,
+3 us sys fence, signal per tile, so it needs 16 blocks to reach the 90 GB/s cap). Dead ends measured: programmatic dependent
+launch of the QKV GEMM (no gain: the persistent GEMM has no tail to fill), a unicast reducer reading the 4 copies directly
+(slower, and its traffic slows the GEMM *more* than multimem's: interference scales with bytes moved, so fewest-bytes multimem
+stays), consumer-side and producer-warp reducers (above). Raster 2 (panel order) costs the down GEMM 8-13 % so the down GEMM and
+the reducer stay at raster 1; the QKV GEMM's order is independent and raster 2 is ~15 % faster for it.
+
+Reducer v2 (2 tiles per iteration, signal deferred one iteration; QKV at raster 2) and the R sweep (b2b ms, M=4096):
+down on 132-R SMs 0.63/0.70/0.71/0.71 for R=4/6/8/12; down + reducer v2 1.49/1.12/0.95/0.80. The reducer is throughput-bound
+at ~4-5 GB/s per block (32 KB per ~6 us iteration), so it still needs R=12. Chains: v2 R=12 1.087 (4k), 2.265 (8k), 4.918 (16k)
+vs v1 R=16 1.108 / 2.343 / 5.147; at 1k-2k v1 R=16 is marginally better (0.350 / 0.606). Why the deferral did not help: the
+`fence.acq_rel.sys` issued after the block barrier is cumulative over *all* threads' stores of the current iteration, so the
+block still stalls ~3 us per iteration. Next: v3 = dedicated signaller warp with named-barrier backpressure (workers never wait
+on the fence) and 2-4 tiles per iteration, aiming at R=4-6.
+
+Reducer v3/v4 (`tp4_reduce3_kernel<T>`, 544 threads = 16 worker warps + 1 signaller warp; workers hand finished tiles to the
+signaller through named barriers 1/2/3 and never wait on the sys fence; T = 2 (v3) or 4 (v4) tiles per iteration). The fence
+itself costs 0.18 ms at R=8 (measured by skipping the signal, dbg=16), and decoupling it helps the reducer stage (down + reducer
+at R=8: v2 0.95 -> v3 0.79 ms) but the chain only moves from 1.108 (v1 R=16) / 1.087 (v2 R=12) to 1.079 (v3 R=8) at M=4k:
+the saved 8 SMs are worth ~0.05 ms and the residual is the traffic interference, which no reducer organisation removes.
+Correctness unchanged (x 4.5e-3 = multimem error, out 4.4e-3, 30-forward stress and 0 ordering violations).
+
+Final chain numbers (b2b ms, best R per M, QKV raster 2, down raster 1 swizzle 1):
+
+| M | floor (2 GEMMs) | chain | config | best baseline | gain | gate |
+|---|---|---|---|---|---|---|
+| 1024 | 0.236 | 0.344 | v3 R=12 | multimem 0.439 | 22 % | >= 20 % vs multimem: met |
+| 2048 | 0.477 | 0.595 | v3 R=12 | multimem 0.845 (asynctp 0.867) | 30 % | met |
+| 4096 | 0.943 | 1.080 | v4 R=8 (v3 1.079) | asynctp 1.265 | 15 % | >= 10 % vs asynctp: met |
+| 8192 | 1.973 | 2.248 | v3 R=8 | asynctp 2.483 | 9 % | marginal |
+| 16384 | 4.289 | 4.793 | v4 R=8 | asynctp 4.929 | 3 % | not a target (link ratio favours async-TP) |
+
+Decision: stop kernel iteration here. Production configuration = mode 4 GEMM (raster 1, swizzle 1, sm_count = SMs - R), reducer
+v3 with R = 12 for M <= 2048 and 8 above, QKV mode 2 at raster 2, both GEMMs on SMs - R. Remaining work is productisation:
+device-side epoch so the forward is CUDA-graph capturable (removes ~0.05-0.1 ms of host launch overhead per step, which is the
+largest remaining item at M <= 2k), cached workspace, `CtappBoundary` on this path, tests and the final benchmark table in
+`results/tp4_chain.md`.
+
+### Phase 4 result (2026-10-02)
+
+Productionised path (`CtappBoundary` in `ctapp/tp4.py`): the epoch lives on the device (bumped by `add_(1)` at the start of each forward), so the forward is CUDA-graph capturable (two graphs, one per epoch parity, because the `rowss` pointer is baked into the QKV epilogue); `set_weights` runs a warm-up launch of both GEMMs because CUDA lazy module loading deadlocks (spin-limit trap) against an already-resident spinning reducer. TP4, l70b_qkv, b2b ms, best ctapp vs best baseline, gain = 1 - ctapp / best baseline: M=1024 0.344 vs 0.452 (multimem), 24 %; 2048 0.591 vs 0.663 (asynctp), 11 % (33 % vs multimem, 32 % vs Step 0's async-TP 0.867); 4096 1.070 vs 1.280, 16 %; 8192 2.284 vs 2.534, 10 %; 16384 4.764 vs 5.016, 5 %. The gate (>= 10 % over async-TP at 4k/8k, >= 20 % over multimem at 1k-2k) is met at 1k (24 % vs multimem), 4k (16 %) and 8k (10 %, marginal); at 2k it is met vs multimem and marginal vs async-TP. Full tables in `results/tp4_chain.md`.
