@@ -1,0 +1,39 @@
+M,method,variant,median_us,p10_us,p90_us
+4096,OneGpuCublas,,1385.9,1384.7,1389.0
+4096,Ctapp,cfg7/7 group8,1284.8,1268.4,1289.8
+4096,Ctapp,cfg7/7 group1,1232.7,1219.1,1258.2
+4096,Ctapp,cfg4/4 group8,2541.3,2149.6,2680.8
+4096,Ctapp,cfg6/6 group8,1624.9,1606.2,1684.2
+4096,OneGpuTma,cfg4,1691.2,1688.1,1693.2
+4096,MicroBatchTma,cfg4 chunk=256,1156.6,1154.4,1163.0
+4096,MicroBatchTma,cfg4 chunk=512,1045.0,1037.8,1055.6
+4096,MicroBatchTma,cfg4 chunk=1024,1094.5,1083.7,1096.6
+4096,MicroBatchTma,cfg4 chunk=2048,1326.1,1322.5,1331.0
+4096,MicroBatchTma,cfg4 chunk=4096,1887.2,1871.1,1942.2
+4096,OneGpuTma,cfg7,1873.4,1864.9,1884.1
+4096,MicroBatchTma,cfg7 chunk=256,1462.1,1450.0,1466.7
+4096,MicroBatchTma,cfg7 chunk=512,995.5,988.9,997.4
+4096,MicroBatchTma,cfg7 chunk=1024,1169.4,1165.8,1183.0
+4096,MicroBatchTma,cfg7 chunk=2048,1493.2,1475.5,1501.2
+4096,MicroBatchTma,cfg7 chunk=4096,2068.3,2056.6,2075.9
+16384,OneGpuCublas,,6219.9,6212.6,6228.2
+16384,Ctapp,cfg7/7 group8,4406.0,4370.7,4418.3
+16384,Ctapp,cfg7/7 group1,4640.6,4582.4,4907.2
+16384,Ctapp,cfg4/4 group8,11305.2,11125.8,11460.9
+16384,Ctapp,cfg6/6 group8,6220.1,6048.1,6549.7
+16384,OneGpuTma,cfg4,8711.5,8616.7,8879.6
+16384,MicroBatchTma,cfg4 chunk=256,4333.5,4329.0,4343.7
+16384,MicroBatchTma,cfg4 chunk=512,3768.0,3735.1,3777.4
+16384,MicroBatchTma,cfg4 chunk=1024,3616.0,3606.3,3626.7
+16384,MicroBatchTma,cfg4 chunk=2048,3881.8,3865.0,3888.5
+16384,MicroBatchTma,cfg4 chunk=4096,4560.8,4529.6,4635.6
+16384,MicroBatchTma,cfg4 chunk=8192,6370.3,6323.1,6465.9
+16384,MicroBatchTma,cfg4 chunk=16384,9225.8,8872.2,9441.4
+16384,OneGpuTma,cfg7,9188.1,9115.7,9229.6
+16384,MicroBatchTma,cfg7 chunk=256,5492.7,5485.6,5498.9
+16384,MicroBatchTma,cfg7 chunk=512,3560.5,3552.3,3578.0
+16384,MicroBatchTma,cfg7 chunk=1024,3862.3,3845.5,3873.0
+16384,MicroBatchTma,cfg7 chunk=2048,4333.1,4309.6,4351.9
+16384,MicroBatchTma,cfg7 chunk=4096,4947.4,4920.9,4967.9
+16384,MicroBatchTma,cfg7 chunk=8192,6244.8,6146.7,6466.9
+16384,MicroBatchTma,cfg7 chunk=16384,9006.4,8965.8,9198.6

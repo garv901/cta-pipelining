@@ -10,7 +10,8 @@ import matplotlib.pyplot as plt
 from ctapp.ext import ROOT, load
 from ctapp.timing import measure
 from ctapp.pipeline import Pipeline
-from ctapp.methods import Base, Ctapp, N, K, BF
+from ctapp.methods import Base, Ctapp, BF
+N = K = 8192
 
 ext = load()
 ext.enable_peer_access(0, 1); ext.enable_peer_access(1, 0)
@@ -61,7 +62,7 @@ class Timeline(Base):
     """kind: pipe = producer on A + consumer on B (as fig5 Ctapp); cons = consumer alone on B, pre-filled queue; prod = producer alone on A."""
 
     def __init__(self, M, X, W1, W2, g, kind):
-        self.pl = Pipeline(M, N, K, CFG, CFG, devA=0, devB=1, fence=FENCE, group_rows=g, scoreboard=SB)
+        self.pl = Pipeline(M, K, N, N, CFG, CFG, devA=0, devB=1, fence=FENCE, group_rows=g, scoreboard=SB)
         self.X, self.W1, self.W2, self.kind = X, W1, W2, kind
         pl = self.pl
         self.sA = torch.zeros(pl.src_a.numel() * 8, device="cuda:0", **i64); self.sB = torch.zeros(pl.src_b.numel() * 8, device="cuda:1", **i64)

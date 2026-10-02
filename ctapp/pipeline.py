@@ -4,12 +4,12 @@ from ctapp.ext import load
 EMPTY = -1
 
 
-def build_deps(M, N1, BM1, BN1, BM2, BN2, rowpanel=True):
-    """CSR dependency array over producer tiles (row-major ids) + consumer scoreboard init. Assumes N2 = N1.
+def build_deps(M, N1, N2, BM1, BN1, BM2, BN2, rowpanel=True):
+    """CSR dependency array over producer tiles (row-major ids) + consumer scoreboard init.
     rowpanel=False: deps/counters per consumer tile. rowpanel=True: per consumer row panel (every tile of a panel has the same
     deps); counters are padded to 32 ints (one 128 B line) each."""
     tm1, tn1 = -(-M // BM1), -(-N1 // BN1)
-    tm2, tn2 = -(-M // BM2), -(-N1 // BN2)
+    tm2, tn2 = -(-M // BM2), -(-N2 // BN2)
     m1 = torch.arange(tm1)
     lo = torch.div(m1 * BM1, BM2, rounding_mode="floor")
     hi = torch.div(torch.clamp((m1 + 1) * BM1, max=M) - 1, BM2, rounding_mode="floor")
@@ -34,16 +34,16 @@ def build_deps(M, N1, BM1, BN1, BM2, BN2, rowpanel=True):
 class Pipeline:
     """2-layer CTA-pipelined run: producer GEMM on devA writes Y1 into devB memory, consumer GEMM on devB."""
 
-    def __init__(self, M, N, K, cfg1, cfg2, devA=0, devB=1, skip_wait=0, fence=0, group_rows=0, scoreboard="rowpanel"):
+    def __init__(self, M, K, N1, N2, cfg1, cfg2, devA=0, devB=1, skip_wait=0, fence=0, group_rows=0, scoreboard="rowpanel"):
         self.ext = load()
         self.ext.enable_peer_access(devA, devB); self.ext.enable_peer_access(devB, devA)
         self.M, self.cfg1, self.cfg2, self.skip_wait, self.fence = M, cfg1, cfg2, skip_wait, fence
         self.rowpanel = int(scoreboard == "rowpanel"); assert scoreboard in ("rowpanel", "tile")
         self.a, self.b = torch.device("cuda", devA), torch.device("cuda", devB)
         BM1, BN1 = self.tile(cfg1); BM2, BN2 = self.tile(cfg2)
-        self.tn1, self.tn2 = -(-N // BN1), -(-N // BN2)
+        self.tn1, self.tn2 = -(-N1 // BN1), -(-N2 // BN2)
         P, C = -(-M // BM1) * self.tn1, -(-M // BM2) * self.tn2
-        off, cons, sb = build_deps(M, N, BM1, BN1, BM2, BN2, bool(self.rowpanel))
+        off, cons, sb = build_deps(M, N1, N2, BM1, BN1, BM2, BN2, bool(self.rowpanel))
         i32 = dict(dtype=torch.int32)
         self.src_a = torch.arange(P, device=self.a, **i32)
         if group_rows:  # producer tile order: groups of group_rows tile-rows, n-major inside a group (row-major = L2-hostile, see results/overhead.md)
@@ -54,8 +54,8 @@ class Pipeline:
         self.sb_pristine = sb.to(self.a); self.sb = self.sb_pristine.clone()
         self.src_b = torch.full((C,), EMPTY, device=self.b, **i32)
         self.head_b = torch.zeros(1, device=self.b, **i32); self.tail_b = torch.zeros(1, device=self.b, **i32)
-        self.Y1 = torch.empty(M, N, device=self.b, dtype=torch.bfloat16)
-        self.Y2 = torch.empty(M, N, device=self.b, dtype=torch.bfloat16)
+        self.Y1 = torch.empty(M, N1, device=self.b, dtype=torch.bfloat16)
+        self.Y2 = torch.empty(M, N2, device=self.b, dtype=torch.bfloat16)
 
     def tile(self, cfg):
         s = self.ext.config_info(cfg).split("tile ")[1].split("x")

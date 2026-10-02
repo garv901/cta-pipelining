@@ -1,0 +1,56 @@
+M,method,variant,median_us,p10_us,p90_us
+1024,OneGpuCublas,,353.2,352.2,354.4
+1024,MicroBatchCublas,chunk=256,323.5,319.9,325.3
+1024,MicroBatchCublas,chunk=512,321.3,319.2,329.3
+1024,MicroBatchCublas,chunk=1024,418.1,415.5,424.9
+1024,TensorParallel2,,266.3,265.0,268.4
+1024,Ctapp,cfg7/7 group8,505.7,497.7,514.7
+1024,Ctapp,cfg7/7 group1,397.1,393.1,405.5
+1024,Ctapp,cfg4/4 group8,603.9,535.5,623.1
+1024,Ctapp,cfg6/6 group8,533.2,519.8,543.8
+2048,OneGpuCublas,,709.9,708.8,711.1
+2048,MicroBatchCublas,chunk=256,569.6,557.1,571.4
+2048,MicroBatchCublas,chunk=512,509.3,507.0,510.7
+2048,MicroBatchCublas,chunk=1024,591.3,589.7,601.0
+2048,MicroBatchCublas,chunk=2048,799.9,792.2,810.3
+2048,TensorParallel2,,499.0,496.1,507.9
+2048,Ctapp,cfg7/7 group8,764.5,756.6,776.2
+2048,Ctapp,cfg7/7 group1,670.2,665.7,681.2
+2048,Ctapp,cfg4/4 group8,1161.3,1096.4,1241.4
+2048,Ctapp,cfg6/6 group8,889.3,884.2,896.9
+4096,OneGpuCublas,,1413.3,1411.6,1415.4
+4096,MicroBatchCublas,chunk=256,1047.1,1042.1,1051.3
+4096,MicroBatchCublas,chunk=512,892.4,883.2,894.7
+4096,MicroBatchCublas,chunk=1024,959.9,959.1,965.3
+4096,MicroBatchCublas,chunk=2048,1163.5,1161.9,1169.0
+4096,MicroBatchCublas,chunk=4096,1587.9,1583.9,1597.0
+4096,TensorParallel2,,962.8,960.8,974.2
+4096,Ctapp,cfg7/7 group8,1287.4,1273.6,1299.8
+4096,Ctapp,cfg7/7 group1,1236.3,1216.8,1256.8
+4096,Ctapp,cfg4/4 group8,2336.2,2111.6,2597.3
+4096,Ctapp,cfg6/6 group8,1640.6,1609.9,1662.6
+8192,OneGpuCublas,,2987.2,2891.1,3143.3
+8192,MicroBatchCublas,chunk=256,2000.8,1994.2,2003.0
+8192,MicroBatchCublas,chunk=512,1649.7,1641.6,1651.9
+8192,MicroBatchCublas,chunk=1024,1690.8,1688.4,1698.8
+8192,MicroBatchCublas,chunk=2048,1884.5,1881.5,1892.1
+8192,MicroBatchCublas,chunk=4096,2301.4,2296.7,2306.7
+8192,MicroBatchCublas,chunk=8192,3237.1,3228.3,3247.3
+8192,TensorParallel2,,1916.6,1909.0,1922.9
+8192,Ctapp,cfg7/7 group8,2333.4,2312.5,2342.1
+8192,Ctapp,cfg7/7 group1,2378.0,2339.2,2425.3
+8192,Ctapp,cfg4/4 group8,5410.6,4797.5,5545.2
+8192,Ctapp,cfg6/6 group8,3180.8,3118.1,3271.0
+16384,OneGpuCublas,,6344.9,6277.5,6361.9
+16384,MicroBatchCublas,chunk=256,3927.2,3916.4,3932.2
+16384,MicroBatchCublas,chunk=512,3165.8,3159.6,3172.4
+16384,MicroBatchCublas,chunk=1024,3153.1,3149.9,3162.1
+16384,MicroBatchCublas,chunk=2048,3330.6,3321.8,3335.3
+16384,MicroBatchCublas,chunk=4096,3738.8,3731.7,3744.6
+16384,MicroBatchCublas,chunk=8192,4701.4,4690.6,4704.0
+16384,MicroBatchCublas,chunk=16384,6454.1,6448.0,6458.3
+16384,TensorParallel2,,3845.2,3807.3,3859.3
+16384,Ctapp,cfg7/7 group8,4374.1,4349.5,4423.7
+16384,Ctapp,cfg7/7 group1,4885.5,4584.5,5061.7
+16384,Ctapp,cfg4/4 group8,11296.2,10402.4,11493.5
+16384,Ctapp,cfg6/6 group8,6152.8,6000.5,6344.8
