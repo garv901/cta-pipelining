@@ -6,17 +6,51 @@ This repository explores **CTA-pipelining** ([arXiv:2607.07862](https://arxiv.or
 
 The paper's end-to-end results come from B200 GPUs with NVLink 5 and an NVSwitch. This repo asks how much of the benefit carries over to Hopper (H100), with NVLink 4 point-to-point links and no switch. It compares against the two usual ways of splitting a model across GPUs: micro-batching and tensor parallelism.
 
-## Status and conclusion (2026-10-02)
+## Status and conclusion (2026-10-02, after Phase 6)
 
-**Verdict: for production (vLLM, Llama-70B, TP4, H100) this is a negative-to-marginal result.** The mechanism works and is checked against a reference, but the end-to-end gain is within a few percent of stock and below vLLM's compiled async-TP.
+**Verdict: for production (vLLM, Llama-70B, TP4, H100) this is a negative-to-marginal result.** The mechanism works and is checked
+against a reference. End to end it is 3.7 % faster than stock eager vLLM and 1 % slower than vLLM's compiled async-TP.
 
-- **Built:** a CTA-pipelined TP4 down-proj -> RMSNorm -> QKV boundary (CUTLASS SM90 cooperative GEMM + standalone NVLS multimem reducer + panel-waiting consumer GEMM), productionised in a vLLM plugin that covers both all-reduce boundaries of every Llama layer.
-- **Results:** stand-alone, the chain is 18 % faster than async-TP at 4k tokens (1.053 vs 1.285 ms) against the strongest torch-level baselines. Inside vLLM it is only 3 % faster than stock eager at 4K prefill (280.7 vs 289.9 ms) and 3 % slower than vLLM's compiled async-TP (273.1 ms). The second boundary (o_proj -> gate_up) is break-even at best. Decode is out of scope.
-- **Why (negative findings):**
-  - (a) *Wrong baseline.* The Step-0 "strong baselines" were torch symmetric-memory variants and torch.distributed NCCL, where the 64 MB all-reduce costs ~0.7 ms. vLLM's own NCCL path does it in 0.35-0.38 ms (ring, LL protocol, ~275 GB/s effective over unicast links), and that is what the kernel actually competes with.
-  - (b) *Wrong mechanism.* NVLS multimem was chosen by comparing byte counts (multimem moves P once, ring 1.5 P), but SM-issued multimem throughput is only ~90 GB/s per GPU vs 369 GB/s unicast. The reducer (0.8 ms) outlasts the GEMM it hides behind and costs 8 SMs.
-  - (c) *GEMM efficiency.* Our GEMMs run 1.25-1.6x cuBLAS time in situ (fewer SMs, one tile shape, panel waits, traffic contention), which eats the hidden communication at the o-proj boundary.
-- **What would change the outcome:** first a unicast reduce-scatter/all-gather reducer with NCCL-class bandwidth (a go/no-go experiment), then consumer-GEMM efficiency. See `results/vllm_prefill_4k.md` and PLAN.md Phase 5 ("Conclusion and incorrect assumptions"). One discrepancy is still open: our bench's NCCL all-reduce measures ~0.75 ms, vLLM's 0.35-0.38 ms.
+- **Built:** a CTA-pipelined TP4 boundary for both all-reduces of every Llama layer (down-proj -> norm -> next QKV, and o_proj ->
+  norm -> gate_up), packaged as a vLLM plugin (`vllm_plugin/`).
+  - Phase 6 protocol "v5": the producer GEMM's epilogue TMA-stores each tile straight into the rank that owns its 128-row panel.
+  - An owner reducer on 4 SMs sums the 4 partials, adds the residual, and pushes x and the RMSNorm row sums to every rank (unicast,
+    epoch value flags).
+  - The consumer GEMM is launched as a PDL dependent and waits per panel.
+  - One instance sized `CTAPP_MAX_M` serves every M.
+- **Results (80 layers, 4K prefill, b=1, median ms):**
+  - stock eager 291.5; compiled async-TP 277.9.
+  - Ours, both boundaries: **280.8** (3.7 %); down-only: 281.4 (3.5 %).
+  - Phase 5's multimem v3 down-only: 281.0.
+  - At b=4 and at 8K tokens async-TP pulls further ahead (7.3 % / 9.4 % vs our 3-5 %).
+  - The Phase 6 target (>= 8 % over eager AND faster than async-TP) is not met.
+- **Why (measured):**
+  - (a) The reduction is now hidden and cheap: v5 reducer on 4 SMs vs multimem on 8-12. The boundary is bounded by its two GEMMs.
+    The producer pays a 1.13-1.22x remote-store (scatter) penalty, and the o_proj -> gate_up boundary is bound by our gate_up GEMM
+    (1.2x cuBLAS).
+  - (b) Over a full 80-layer prefill the GPUs sit at the 700 W power cap. Overlap removes the low-power all-reduce phases, so the
+    overlapped boundary runs at a median SM clock of 1470 MHz against 1680 MHz for stock. A boundary that saves 0.25 ms in a short
+    trace saves 0.17 ms in the real run.
+  - (c) Baseline correction: the torch-level `nccl` baseline used in the early micro-benchmarks was ~0.7 ms because it included
+    an unfused eager add + RMSNorm. The NCCL all-reduce itself is 0.33 ms in every setup.
+- **Details:** `results/vllm_prefill_4k.md` (Phase 5 and Phase 6 ablations, profiles, power), PLAN.md "Phase 6", and
+  `results/phase6_s{1,2,3,4}.md`.
+
+Run the plugin with `CTAPP_VLLM=1` (installed with `uv pip install -e vllm_plugin` in the vLLM venv, `CUDA_MODULE_LOADING=LAZY`).
+The knobs are:
+
+| knob | values | default |
+|---|---|---|
+| `CTAPP_BOUNDARY` | `both`, `down`, `oproj` | `both` |
+| `CTAPP_PROTO` | `v5`, `v3` (Phase 5 multimem) | `v5` |
+| `CTAPP_FUSION` | `none`, `pdl`, `pdl1`, `role` | `pdl` |
+| `CTAPP_STEAL` | `0`, `1` | o_proj boundary 1, down boundary 0 |
+| `CTAPP_QKV_TILE` | `256`, `128` | `256` |
+| `CTAPP_MAX_M` | larger M fall back to stock | `8192` |
+| `CTAPP_R` | reducer SMs | `4` |
+
+Benchmarks: `bench/vllm_prefill.py --variant ctapp --boundary both --proto v5 --fusion pdl`, and `--variant eager` /
+`compiled_asynctp` for the baselines.
 
 All measured numbers below and in `results/` are kept as measured; the stand-alone gains in particular are against torch-level baselines and overstate what an engine can gain.
 
@@ -99,7 +133,7 @@ Back-to-back, world 4, 50 iterations (gain = 1 - ctapp / best baseline):
 | 8192 | 2.046 | 2.236 (ctapp) | 2.531 (asynctp) | 12 % |
 | 16384 | 4.248 | 4.754 (ctapp) | 5.022 (asynctp) | 5 % |
 
-Caveat: vLLM's eager NCCL path does the 64 MB all-reduce ~2x faster than the `nccl` baseline here (see Status and conclusion). Baselines: multimem all-reduce, FlashInfer fused all-reduce + residual + RMSNorm (`trtllm_allreduce_fusion`), async-TP, NCCL.
+Caveat (corrected in Phase 6): the `nccl` row is the 0.33 ms all-reduce plus ~0.61 ms of unfused eager add + RMSNorm, so it overstates the stock boundary; vLLM's stock eager boundary is ~1.25-1.32 ms at 4k (see Status and conclusion and `results/tp4_chain.md`). Baselines: multimem all-reduce, FlashInfer fused all-reduce + residual + RMSNorm (`trtllm_allreduce_fusion`), async-TP, NCCL.
 
 Known limitations:
 - Epoch parity needs two graphs: the QKV epilogue's `rowss` pointer is baked in and double-buffered, so `use_graph=True` captures once per parity.
@@ -108,7 +142,7 @@ Known limitations:
 - The QKV GEMM runs on SMs - R SMs even though the reducer is idle then.
 
 ### vLLM plugin
-`vllm_plugin/` is a vLLM 0.30.0 plugin that swaps both TP all-reduce boundaries of every Llama layer (o_proj -> norm -> gate_up and down_proj -> norm -> next QKV) for `CtappBoundary`, falling back to the stock path for M < 512 or M not a multiple of 128. Install with `uv pip install -e vllm_plugin` into the vLLM venv and enable with `CTAPP_VLLM=1` (`CTAPP_BOUNDARY=both|down|oproj`, `CTAPP_R`, `CTAPP_A_RASTER/SWIZZLE`, `CTAPP_B_RASTER/SWIZZLE`, `CTAPP_CHECK`). Details, ablation and profiles: `results/vllm_prefill_4k.md`. Result: on Llama-3.1-70B TP4 4K prefill the down boundary gives 3 % over stock eager (280.7 vs 287.5 ms; 289.9 in the same session as the ablation) but trails vLLM's compiled async-TP (273.1 ms) by 3 %, because the reduction is hidden but our GEMMs run 1.3-1.6x cuBLAS time in situ. Overall a negative-to-marginal production result; see Status and conclusion.
+`vllm_plugin/` is a vLLM 0.30.0 plugin that swaps both TP all-reduce boundaries of every Llama layer (o_proj -> norm -> gate_up and down_proj -> norm -> next QKV) for `CtappBoundary`, falling back to the stock path for M < 512 or M not a multiple of 128. Install with `uv pip install -e vllm_plugin` into the vLLM venv and enable with `CTAPP_VLLM=1` (`CTAPP_BOUNDARY=both|down|oproj`, `CTAPP_PROTO=v5|v3`, `CTAPP_FUSION`, `CTAPP_STEAL`, `CTAPP_QKV_TILE`, `CTAPP_MAX_M`, `CTAPP_R`, `CTAPP_A_RASTER/SWIZZLE`, `CTAPP_B_RASTER/SWIZZLE`, `CTAPP_CHECK`; see Status and conclusion). Details, ablation and profiles: `results/vllm_prefill_4k.md`. Phase 5 result (v3): the down boundary gives 3 % over stock eager (280.7 vs 289.9 ms same session) and trails compiled async-TP (273.1 ms) by 3 %. Phase 6 result (v5, both boundaries): 280.8 vs 291.5 ms eager (3.7 %) and 277.9 ms async-TP. See Status and conclusion.
 
 ## Layout
 ```

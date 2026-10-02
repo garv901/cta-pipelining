@@ -6,6 +6,12 @@ p = argparse.ArgumentParser()
 p.add_argument("--variant", default="compiled", choices=["eager", "compiled", "compiled_fi", "compiled_asynctp", "compiled_fi_big", "ctapp"])
 p.add_argument("--r", type=int, default=None, help="ctapp: CTAPP_R reducer blocks (default: rule 12 for M<=2048 else 8)")
 p.add_argument("--boundary", default=None, choices=["both", "down", "oproj"], help="ctapp: CTAPP_BOUNDARY (default both)")
+p.add_argument("--proto", default=None, choices=["v3", "v5"], help="ctapp: CTAPP_PROTO (plugin default v5)")
+p.add_argument("--fusion", default=None, choices=["none", "pdl", "pdl1", "role"], help="ctapp v5: CTAPP_FUSION (plugin default pdl)")
+p.add_argument("--steal", default=None, choices=["0", "1"], help="ctapp v5: CTAPP_STEAL for both boundaries (plugin default A 1, B 0)")
+p.add_argument("--qkv-tile", type=int, default=None, choices=[128, 256], help="ctapp v5: CTAPP_QKV_TILE (boundary B consumer)")
+p.add_argument("--max-m", type=int, default=None, help="ctapp: CTAPP_MAX_M (plugin default 8192)")
+p.add_argument("--tag", default="", help="suffix of the result tag / JSON name (e.g. a session id)")
 p.add_argument("--seq", type=int, default=4096)
 p.add_argument("--batch", default="1,2,4")
 p.add_argument("--iters", type=int, default=10)
@@ -14,12 +20,17 @@ p.add_argument("--tp", type=int, default=4)
 p.add_argument("--model", default=glob.glob("/data/garv901-55613a/hf/hub/models--NousResearch--Meta-Llama-3.1-70B/snapshots/*")[0])
 a = p.parse_args()
 TAG = a.variant + (f"_{a.boundary}" if a.variant == "ctapp" and a.boundary else "") + (f"_R{a.r}" if a.variant == "ctapp" and a.r else "")
+if a.variant == "ctapp":
+    TAG += (f"_{a.proto}" if a.proto else "") + (f"_{a.fusion}" if a.fusion else "") + (f"_steal{a.steal}" if a.steal else "")
+    TAG += (f"_t{a.qkv_tile}" if a.qkv_tile else "") + (f"_maxM{a.max_m}" if a.max_m else "")
+TAG += (f"_{a.tag}" if a.tag else "") + (f"_seq{a.seq}" if a.seq != 4096 else "")
 if a.variant == "ctapp":   # must be set before importing vllm: spawned workers inherit the environment
     os.environ["CTAPP_VLLM"] = "1"
-    if a.r:
-        os.environ["CTAPP_R"] = str(a.r)
-    if a.boundary:
-        os.environ["CTAPP_BOUNDARY"] = a.boundary
+    for k, v in (("CTAPP_R", a.r), ("CTAPP_BOUNDARY", a.boundary), ("CTAPP_PROTO", a.proto), ("CTAPP_FUSION", a.fusion),
+                 ("CTAPP_STEAL", a.steal), ("CTAPP_QKV_TILE", a.qkv_tile), ("CTAPP_MAX_M", a.max_m)):
+        if v:
+            os.environ[k] = str(v)
+    os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 
 CC = {
     "eager": None,
@@ -58,7 +69,7 @@ def main():
     for r in rows:
         print(f"{r['batch']:3d} {r['tokens']:6d} {r['median_ms']:11.2f} {r['min_ms']:8.2f} {r['tok_per_s_median']:12.0f}")
     os.makedirs("build", exist_ok=True)
-    json.dump(dict(variant=TAG, seq=a.seq, iters=a.iters, rows=rows), open(f"build/vllm_prefill_{TAG}.json", "w"), indent=1)
+    json.dump(dict(variant=TAG, seq=a.seq, iters=a.iters, rows=rows, env={k: v for k, v in os.environ.items() if k.startswith("CTAPP_")}), open(f"build/vllm_prefill_{TAG}.json", "w"), indent=1)
 
 if __name__ == "__main__":
     main()

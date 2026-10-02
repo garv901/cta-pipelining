@@ -441,12 +441,159 @@ Known issue: a one-off illegal-memory-access crash at pool-instance creation mid
 
 Verdict: negative-to-marginal for production at TP4 (3 % over stock eager, 3 % behind compiled async-TP at 4K prefill). Three assumptions made in Step 0 / Phase 4 did not hold.
 
-1. **Baseline.** Assumption: the Step-0 "strong baselines" (torch symmetric-memory variants, torch.distributed NCCL; 64 MB all-reduce ~0.7 ms) represent what an engine pays. Evidence: vLLM's PyNccl path does the same all-reduce in 0.35-0.38 ms (`ncclDevKernel_AllReduce_Sum_bf16_RING_LL`, ~275 GB/s effective), and stock boundary B is 1.32 ms vs ours 1.12 ms. Consequence: the 18 % stand-alone gain (1.053 vs 1.285 ms) shrinks to 3 % vs eager and goes negative vs compiled async-TP.
+1. **Baseline.** Assumption: the Step-0 "strong baselines" (torch symmetric-memory variants, torch.distributed NCCL; 64 MB all-reduce ~0.7 ms) represent what an engine pays. (Phase 6 correction: the torch.distributed all-reduce itself is 0.33 ms too; the ~0.7 ms row included the unfused eager add + RMSNorm, so the loose baseline was the unfused norm, not NCCL.) Evidence: vLLM's PyNccl path does the same all-reduce in 0.35-0.38 ms (`ncclDevKernel_AllReduce_Sum_bf16_RING_LL`, ~275 GB/s effective), and stock boundary B is 1.32 ms vs ours 1.12 ms. Consequence: the 18 % stand-alone gain (1.053 vs 1.285 ms) shrinks to 3 % vs eager and goes negative vs compiled async-TP.
 2. **Mechanism.** Assumption: NVLS multimem is the matching mechanism because it moves P bytes once vs 1.5 P for a ring. Evidence: SM-issued multimem reduction runs at ~90 GB/s per GPU vs 369 GB/s unicast; the reducer takes 0.72-0.84 ms for 64 MB (NCCL ring 0.35 ms), outlasts the 0.78 ms producer GEMM and occupies 8-12 SMs. Consequence: the reduction is hidden only because the GEMM is slow, R cannot shrink, and the SMs taken by the reducer slow the GEMMs.
 3. **GEMM efficiency.** Assumption: our cooperative GEMMs are close to cuBLAS when run as producer/consumer. Evidence: in situ 1.25x (producer) and 1.3-1.6x (consumers) cuBLAS time (120-124 SMs, one 128x256 tile, panel waits, reducer traffic; gate_up consumer 1.37x after the swizzle fix). Consequence: the hidden communication is spent on slower compute; boundary A is break-even at best (~2.01 ms vs 1.83 ms stock in the profile; 288-293 vs 289.9 ms end to end).
 
-**Open discrepancy (not explained).** Our bench's `nccl` variant (torch.distributed all_reduce, bf16, 64 MB) measures ~0.75 ms in BOTH venvs (torch 2.12 NCCL, and torch 2.13 with NCCL 2.29.7), while vLLM's PyNccl path shows 0.35-0.38 ms in the profiler trace (RING_LL kernel, 24 blocks). The cause (algorithm/protocol selection, communicator setup, or measurement method) is NOT established. Measure it before making any further baseline claims.
+**Open discrepancy, resolved in Phase 6 S1 (see "Phase 6" below, "Corrections").** It was not NCCL: the 64 MB all-reduce is 0.33 ms b2b in both venvs, through torch.distributed and PyNccl alike (Ring / Simple, 24 channels); the bench's `nccl` row (~0.75 ms attributed to the reduction) also contained 0.61 ms of unfused eager add + fp32 RMSNorm, and `..._RING_LL` is NCCL's entry-kernel name, not the protocol. Original text, kept for the record: our bench's `nccl` variant measures ~0.75 ms in BOTH venvs while vLLM's PyNccl path shows 0.35-0.38 ms in the profiler trace; the cause was not established at the time.
 
 **Step-0 decision superseded.** "NVLS is the right baseline and multimem the matching mechanism at t >= 4" (Step 0 section above) is superseded by the Phase 5 evidence (findings 1 and 2). It is kept in place for the record.
 
-**What would change the outcome.** (i) Go/no-go: a unicast reduce-scatter/all-gather reducer with NCCL-class bandwidth and a light flag protocol; if it cannot reach ~0.35 ms for 64 MB there is no case. (ii) Then consumer-GEMM efficiency (132 SMs after the reducer retires, better tile for N=14336).
+**What would change the outcome.** (i) Go/no-go: a unicast reduce-scatter/all-gather reducer with NCCL-class bandwidth and a light flag protocol; if it cannot reach ~0.35 ms for 64 MB there is no case. (ii) Then consumer-GEMM efficiency (132 SMs after the reducer retires, better tile for N=14336). **Tested in Phase 6:** (i) passed (unicast reducer hidden on 4 SMs), (ii) partly (128-SM consumers, PDL start, steal at A), yet the end-to-end gain is 3.7 % over eager and 1 % behind async-TP; the binding limits are the GEMMs, the scatter penalty, the gate_up consumer and the 700 W power cap (see Phase 6 conclusion).
+
+## Phase 6 (2026-10-02): panel-ownership unicast protocol (v5), PDL-fused boundary, vLLM re-ablation
+
+Goal (plan `humble-squishing-kite`): fix the three Phase 5 losses: the multimem reducer (~90 GB/s, 0.72-0.84 ms for 64 MB,
+outlasting the producer), the producer/consumer GEMMs on 124 SMs, and the 3-kernel / 2-stream boundary. Success criterion: both
+boundaries >= 8 % faster than stock eager at 4K prefill AND faster than compiled async-TP. Stage reports:
+`results/phase6_s1.md` (go/no-go probes), `phase6_s2.md` (v5 in 3-kernel form), `phase6_s3.md` (PDL fusion, consumer tile, tail
+order), `phase6_s4.md` (vLLM re-ablation); end-to-end tables in `results/vllm_prefill_4k.md` ("Phase 6").
+
+### Design as built
+
+- **D1 panel-ownership scatter epilogue (producer mode 7, generator patch 8).** Panel m (128 rows) is owned by rank m % 4. The
+  producer GEMM keeps 4 epilogue Params (`epi_dst[4]`, one TMA descriptor per destination rank, all prefetched) and TMA-stores tile
+  (m, n) straight into the owner's inbox slot at row block m / 4; `tp4_after_store` mode 7 drains the store, `fence.acq_rel.sys`,
+  then `st.relaxed.sys` of the epoch into the owner's `tile_flags[src][m/4][n]`. No multimem anywhere.
+- **Value flags.** Every flag holds an epoch (monotone), so nothing is M-dependent: ONE instance sized `max_M` serves every
+  M <= max_M with M % 128 == 0 (no per-M pool, no mid-run creation). A tiny `tp4_step` kernel bumps the device epoch and zeroes
+  `rowss_local` / `panel_done` / `role_ctr` per forward. x stays double-buffered by parity; inbox reuse is safe because a
+  producer of epoch e+1 starts only after its own consumer saw every panel flag of epoch e.
+- **Owner reducer, warp-per-unit (`red_variant=1`, the default).** R = 4 CTAs x 1024 threads on the 4 SMs the 128-SM producer
+  leaves free. Unit = (owned panel, 256-column n-tile, 32-row quarter); each warp owns whole units: 4 `ld.acquire.sys` polls of the
+  source flags, 4 inbox loads + residual, fp32 add, `st.relaxed.sys.v4` of x to the 3 peers + local store, `red.add.f32` of the
+  row sum of squares into `rowss_local`, then its own `fence.acq_rel.sys` + gpu-scope `atomicAdd(panel_done)`; the last arriver
+  pushes the panel's 128 row sums to all 4 ranks, fences, and writes `panel_flag[m] = epoch` on all 4 ranks. The planned lockstep
+  design (31 worker warps + 1 signaller, batch barrier) was built too (`red_variant=0`) and is 0.65 ms alone vs 0.44.
+- **Tail tile order (patch 10, `down_tail="auto"`).** Producer raster 1 / swizzle 1 is m-fast, so every panel completes only in the
+  last wave. The tail order walks the first 32 - C n-tiles m-fast and the last C n-tiles panel-major (C = 16 for M >= 2048, else 8),
+  so the panels of the second-to-last wave are reduced and consumable while the last wave runs. The reducer's unit order follows.
+- **PDL variants (patch 9; `-DCUTLASS_ENABLE_GDC_FOR_SM90=1` added to `ctapp/ext.py`, which was missing, so all `griddepcontrol` PTX
+  had compiled out before).** `fusion="pdl"`: reducer on a side stream, consumer launched as the producer's PDL dependent (stock
+  last-tile trigger), consumer grid 128 (an inversion can only serialise, never deadlock). `"pdl1"`: one stream, reducer (triggers
+  at entry) -> producer (PDL) -> consumer (PDL). `"role"`: consumer grid 132 in mode 8; the first R consumer CTAs run the reducer and
+  then fall through into their GEMM tiles. `steal=True`: the consumer (mode 8) CTAs claim reducer units from a shared counter before
+  their own tiles, so the producer's last wave is reduced on all SMs instead of R.
+- **Role switching was tried and lost** (1.31-1.33 ms at 4k vs 1.07-1.09 for "pdl"): a GEMM CTA has a 214 KB smem carve-out, leaving
+  ~28 KB of L1, which caps the reducer's plain loads in flight. The standalone reducer drops from 0.420 to 0.576 ms when launched with
+  the same carve-out. cp.async staging (L1 bypass) reached only 1.150; stealing recovers 1k (0.313) and boundary A, not 2k-8k on B.
+- **D3 consumer tile.** A 128x128 QKV instance (`GemmQkv128`) is 0.015 ms faster alone at 4k on N = 2560 but gains <= 0.02 in the chain,
+  loses at 1k / 8k and is 0.4-1.4 ms slower on the gate_up shape: tile 256 stays the default.
+- **D4 baseline hygiene (`bench/nccl_ar.py`).** 64 MiB bf16 all-reduce, 4 ranks: 0.33 ms b2b / 0.39-0.42 per call in both venvs,
+  identical through torch.distributed and vLLM's PyNccl, alone or after the down GEMM; NCCL picks Ring / Simple on 24 channels.
+
+### Gate results (micro-bench, TP4, M = 4096 unless noted, b2b ms, max over ranks)
+
+| stage | gate | measured | status |
+|---|---|---|---|
+| S1 (a) reducer-shaped push throughput | >= 180 GB/s/rank on 4 SMs, GEMM slowdown <= 10 % | 8 x 544 thr on 4 SMs: 0.442 ms alone (304 GB/s), 0.582 under the GEMM (231 GB/s); GEMM slowdown -0.7 to +2.9 % | GO (R = 4) |
+| S1 (b) remote-epilogue producer | <= 1.15x at 4k | 100 % of D to one peer: 1.117x per call / 1.110x b2b; 1.18-1.22x at 1k | D1 primary |
+| S1 (c) PDL early launch | works | dependent CTAs start 2.5-3.7 us (eager) / 0.4-0.5 us (graph) after the primary, on exactly the free SMs | GO |
+| S1 (d) last-arriver ordering chain | 0 violations | 0 over 4 ranks (16 / 8 / 1 slots x 5000 iters x 16 KB, 16 slots x 2500 x 256 KB); no-fence control: 1760 stale words | GO |
+| S2 v5 3-kernel chain | <= 1.00 | 1.088 (1.060-1.110 over 5 runs; v3 1.061 same process); 1k 0.332, 8k 2.190, 16k 4.599 (v3 0.345 / 2.248 / 4.770) | missed |
+| S2 producer ‖ reducer | <= producer + 0.05 | +0.041 (warp-per-unit); spec lockstep reducer +0.16-0.28 | met (v1) |
+| S3 boundary B chain, eager | <= 1.02 (revised) | 1.064 (pdl t128) / 1.074 (pdl t256), v3 1.084-1.090 same run; 1.002-1.012 in quieter single-instance runs | missed |
+| S3 boundary B, graph | <= 1.05 | 1.093 (pdl, no input copy) | missed |
+| S3 boundary B, 1k | <= 0.32 | 0.312-0.314 (role + steal); pdl 0.334 | met |
+| S3 boundary A shape (Kr 2048, N2r 14336) | <= 1.70 | 1.882 (pdl + steal), v3 2.152 | missed |
+
+Why the micro-bench gates were missed (S2/S3 stamps): the critical path is producer end -> consumer. The mode-7 producer is
+1.13-1.22x mode 0 (0.72-0.75 vs 0.626 ms at 4k); ~0.09 ms of that is wave-synchronous NVLink egress of the remote TMA stores (the
+all-local ablation is 1.04x), and the 4-way split does not reduce it at 1k. A persistent producer holds its 128 SMs until its last
+tile, so PDL gives the consumer an immediate start (first tile 0-5 us after the producer's last CTA) but no panel-level overlap with
+the producer. With the tail order the reducer is off the critical path. What is left at 4k is producer + consumer at near-peak speed
+(floor 0.95-1.0 ms vs stock 1.32). Boundary A is consumer-bound: gate_up 1.37-1.47 ms alone (cuBLAS 1.34), 1.45-1.55 in situ; the
+0.25-0.34 ms producer cannot hide the 64 MB reduction, so only stealing (reduction on all 128 consumer CTAs, ends 0.44-0.46 ms) helps;
+floor ~0.35 + 0.1 + 1.4 = 1.85 ms vs stock 1.83.
+
+### What did not work
+
+- Lockstep reducer with a signaller warp (S2 spec): ~5 us per batch whatever its size; 0.65 ms alone, producer ‖ reducer +0.16-0.28.
+- R = 8: slower than R = 4 at every M (the GEMMs lose 4 SMs: mode 0 on 124 SMs 0.687 vs 0.626 ms; the R = 4 reducer already keeps up).
+- Producer raster 2 (n fast, panels in order): mode 7 0.778 vs 0.707, chain +0.12 ms.
+- Dropping the per-tile TMA store drain: no gain (the egress, not the drain, is the mode-7 cost).
+- Role switching (L1 carve-out, above); cp.async-staged role reducer (1.150 at 4k).
+- Early producer PDL trigger with the two-stream "pdl" form: launch-order inversion (queued consumer CTAs take the 4 free SMs before
+  the side-stream reducer launches), 1.104-1.158 vs 1.002-1.046 with the stock last-tile trigger.
+- Tile 128 on shape A; pdl1 at 8k (2.33-2.41 vs 2.22-2.24); stealing on B at 2k-8k (no gain).
+
+### S4: vLLM re-ablation (80 layers, TP4, 4K prefill, `results/vllm_prefill_4k.md` "Phase 6")
+
+Plugin (`vllm_plugin/ctapp_vllm/model.py`): `CTAPP_PROTO=v5|v3` (default v5), `CTAPP_FUSION=none|pdl|pdl1|role` (default pdl),
+`CTAPP_STEAL` (unset: A 1, B 0), `CTAPP_QKV_TILE` (B, default 256), `CTAPP_MAX_M` (default 8192); one v5 instance per boundary
+sized max_M, created at the first valid forward under the existing sync + TP-barrier guard; eager only. Correctness on the 4-layer
+config: boundary rel err B 3.5-3.7e-3, A 2.6-2.8e-3; top-1 equal to stock at M = 4096, 8192 and b = 2; top-20 20/20 (19/20 at 8192:
+a tie at rank 20); max |dlogprob| 1.6e-2 / 3.1e-2 (down / both), the same as Phase 5.
+
+| b=1, M=4096 (mean of 2-5 interleaved runs, median ms) | ms | gain vs eager |
+|---|---|---|
+| stock eager | 291.5 | - |
+| compiled async-TP | 277.9 | 4.7 % |
+| v5 down-only (R=4, pdl) | 281.4 | 3.5 % |
+| v5 both (B pdl, A pdl + steal) | 280.8 | 3.7 % |
+| v3 down-only (R=8, Phase 5 config) | 281.0 | 3.6 % |
+
+b=2 / b=4: v5 down 4.7 / 4.6 %, v5 both 3.9 / 3.1 %, async-TP 5.6 / 7.3 %. 8K tokens: v5 down 5.0 %, both 3.4 %, async-TP 9.4 %.
+A without steal: 300.05 ms (worse than eager). A alone (oproj-only): 290.9 (break-even; Phase 5: 297.9).
+
+Profile: boundary B is `tp4_step` -> producer (grid 128) || reducer (grid 4, side stream) -> consumer (grid 128, PDL), with the
+consumer starting as the producer's CTAs retire and the reducer ending 36-53 us after the producer. In a 4-layer trace B takes
+0.99 ms (Phase 5 1.12, stock 1.25 this session), A 1.80 (stock 1.82). At 80 layers B takes 1.13 (stock 1.30) and A 1.91 (stock 1.89).
+The difference is the **700 W power cap**: every variant runs at ~690 W median through the 80-layer prefill, and the overlapped
+boundary runs at a median SM clock of 1470 MHz vs 1680 for stock eager (async-TP 1515). Our kernels slow 11-20 % from the 4-layer to
+the 80-layer run, stock's 4-5 %.
+
+### Corrections to earlier statements
+
+- **Raster integer mapping:** in `make_args` 1 = AlongM (m fast) and 2 = AlongN (n fast). The old comment in `csrc/gemm_tp4.cu`
+  had it the other way round.
+- **"NCCL 0.75 ms"** (Phase 5 "Open discrepancy", `results/tp4_chain.md` caveat): the 64 MB all-reduce is 0.33 ms b2b everywhere
+  (Ring / Simple, 24 channels, same through torch.distributed and PyNccl, in both venvs). The bench's `nccl` row is down 0.622 +
+  AR 0.331 + add 0.070 + eager fp32 RMSNorm 0.538 + QKV 0.220 ms. The 0.75 ms was the all-reduce plus 0.61 ms of unfused add + norm.
+  `..._RING_LL` is NCCL's entry-kernel name, not the protocol; only `NCCL_PROTO=LL` makes the AR itself ~0.74 ms.
+- **Multimem vs unicast:** SM-issued multimem reduction runs at ~90 GB/s per GPU. Unicast SM stores reach 231-304 GB/s per rank on
+  4 SMs (S1), and the v5 reducer finishes 64 MB within ~0.05 ms of the producer GEMM on 4 SMs, against 8-12 SMs and 0.72-0.84 ms for
+  multimem. The mechanism is fixed. The end-to-end gain still is not, because the reduction was never the binding term once
+  hidden (GEMMs, scatter penalty, consumer A, power cap).
+- **Remote-store penalty:** 1.11-1.12x at 4k for 100 % of D to one peer, and 1.13-1.22x for the 4-way panel scatter. It is not
+  reduced by spreading over 3 links; it is wave-synchronous egress.
+- **GDC:** `CUTLASS_ENABLE_GDC_FOR_SM90` was not defined before S3, so every `griddepcontrol` instruction had compiled out and
+  `pdl=1` only set the launch attribute.
+
+### Phase 6 conclusion
+
+**Success criterion not met:**
+- Both boundaries are 3.7 % faster than stock eager at 4K prefill (target >= 8 %), and 1.0 % slower than compiled async-TP.
+- Async-TP's lead grows with tokens per step (b=4: 7.3 % vs our 3.1-4.6 %; 8K: 9.4 % vs 3.4-5.0 %).
+
+**What Phase 6 did fix:**
+- The reduction is now cheap and hidden on 4 SMs.
+- One instance serves every M.
+- The boundary is PDL-chained.
+- Boundary A moved from a loss to break-even.
+- In the micro-bench and in short traces boundary B is 0.99-1.07 ms vs stock 1.25-1.32.
+
+**The measured ceiling:**
+- At TP4 on H100 the overlapped boundary is bounded by its two GEMMs running back to back. The producer pays the scatter penalty:
+  0.73 vs 0.61 ms cuBLAS.
+- Boundary A is consumer-bound: gate_up runs 1.48-1.56 ms in situ vs cuBLAS 1.23-1.26.
+- Over a full 80-layer prefill the GPU sits at its 700 W cap, so hiding the all-reduce mostly converts into lower clocks. The
+  0.25 ms/boundary seen in short traces becomes 0.17 ms, about 11 ms of 291.
+
+**Remaining levers (not built):**
+- A faster gate_up consumer: our SM90 cooperative GEMM is 1.2x cuBLAS at N = 14336.
+- A scatter that does not burst per wave.
+- CUDA graphs / torch.compile around the eager plugin (async-TP gets these for free).
+- Fusing SiLU-and-mul into the gate_up epilogue (~0.05 ms per layer).
+
+None of them changes the power-cap bound, so the realistic upside over async-TP at TP4 is a few percent at best.

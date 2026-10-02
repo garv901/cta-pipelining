@@ -20,12 +20,12 @@ Environment variables:
 |---|---|---|
 | `CTAPP_VLLM` | 1 enables the plugin | 0 |
 | `CTAPP_BOUNDARY` | `both`, `down` (B only), `oproj` (A only) | both |
-| `CTAPP_R` | reducer blocks (SMs taken from the GEMM) | rule: 12 for M <= 2048, else 8 |
+| `CTAPP_R` | reducer blocks (SMs taken from the GEMM) | rule: 12 for M <= 2048, else 8 (v3; v5 default 4) |
 | `CTAPP_A_RASTER` / `CTAPP_A_SWIZZLE` | consumer (gate_up) GEMM order at boundary A | 1 / 2 |
 | `CTAPP_B_RASTER` / `CTAPP_B_SWIZZLE` | consumer (QKV) GEMM order at boundary B | 2 / 1 |
 | `CTAPP_CHECK` | 1 logs per-layer rel err of the boundary output vs the stock computation, and fallbacks | 0 |
 | `CTAPP_LOG_M` | 1 logs every M seen (otherwise only the first time an M is created) | 0 |
-| `CTAPP_MIN_M` / `CTAPP_MAX_M` | M range handled by the pool | 512 / 16384 |
+| `CTAPP_MIN_M` / `CTAPP_MAX_M` | M range handled by the pool | 512 / 16384 in Phase 5 (now 512 / 8192; see Phase 6) |
 
 Implementation notes:
 - RMSNorm gammas are folded IN PLACE into the consumer weights (gate_up, qkv) at setup (no extra weight copies; vLLM's "Model loading took" stays 32.89 GiB per rank). Every stock-path norm in the forward then uses a ones-weight RMSNorm, so the fallback paths stay correct. After re-initialising weights call `model._refold()`.
@@ -147,6 +147,8 @@ Mode 2 with panel counters prefilled (waits pass at once) adds ~0.02 ms at N=143
 
 **Open discrepancy (cause not established).** Our bench's `nccl` variant (torch.distributed all_reduce, bf16, 64 MB) measures ~0.75 ms in both venvs (torch 2.12 NCCL and torch 2.13 / NCCL 2.29.7), while vLLM's PyNccl path shows 0.35-0.38 ms in the profiler trace (`ncclDevKernel_AllReduce_Sum_bf16_RING_LL`, 24 blocks). Algorithm/protocol selection, communicator setup or measurement method could each explain it; measure before making further baseline claims. The torch-level baselines in `results/tp4_chain.md` may therefore overstate the available gain.
 
+**Resolved (Phase 6 S1, `results/phase6_s1.md` probe 6).** The 64 MB all-reduce is 0.33 ms b2b in both venvs and through both APIs (NCCL Ring / Simple, 24 channels). The bench's `nccl` row is down mm 0.622 + all-reduce 0.331 + residual add 0.070 + eager fp32 RMSNorm 0.538 + QKV 0.220 ms, so the ~0.75 ms figure was the all-reduce plus the unfused eager add + RMSNorm (0.61 ms), not a slower all-reduce. `ncclDevKernel_AllReduce_Sum_bf16_RING_LL` is NCCL 2.29's entry-kernel name for every protocol, not evidence of the LL protocol.
+
 (a) The down boundary alone gives 3 % over stock eager at 4k (9-10 ms of 290), 3-4 % at 8k/16k, and loses to vLLM's compiled async-TP (273 ms) by 3 %.
 
 (b) The reduction is fully hidden at both boundaries, so the remaining loss is GEMM efficiency: our consumer GEMMs run 1.3-1.6x cuBLAS time in situ (fewer SMs, 128x256 tile, panel waits, reducer traffic), and our producer 1.25x.
@@ -156,6 +158,148 @@ Mode 2 with panel counters prefilled (waits pass at once) adds ~0.02 ms at N=143
 (d) Decode is out of scope by design (fewer than 2 row panels).
 
 Known issue: a one-off illegal-memory-access crash occurred at pool-instance creation mid-run. It is worked around by a device sync plus a TP barrier before creation (`model.py`); the root cause is unproven.
+
+## Phase 6 (2026-10-02): v5 protocol in vLLM, re-ablation
+
+### Configuration
+
+Plugin defaults changed to the Phase 6 S3 recommendation (`results/phase6_s3.md`); every knob is an env variable read at the first
+forward (all ranks must see the same values):
+
+| variable | meaning | default |
+|---|---|---|
+| `CTAPP_PROTO` | `v5` (panel ownership, unicast, value flags) or `v3` (Phase 5 multimem protocol, one instance per M) | v5 |
+| `CTAPP_FUSION` | v5 boundary form: `none` (3 kernels, 2 streams), `pdl` (consumer = PDL dependent of the producer), `pdl1` (one stream), `role` | pdl |
+| `CTAPP_STEAL` | 1: consumer CTAs claim reducer units before their tiles (mode 8). Unset: A 1, B 0. Set: both boundaries | A 1 / B 0 |
+| `CTAPP_QKV_TILE` | boundary-B consumer tile, 256 (128x256) or 128 (128x128, default swizzle 2). A always uses 256 | 256 |
+| `CTAPP_MAX_M` | v5: the one instance per boundary is sized for this M; larger M takes the stock path | 8192 |
+| `CTAPP_R` | SMs reserved for the reducer (both GEMMs run on SM_count - R) | v5 4, v3 per-M rule (8 at M >= 4096) |
+
+The rest of the table above (`CTAPP_BOUNDARY`, `CTAPP_A/B_RASTER/SWIZZLE`, `CTAPP_CHECK`, `CTAPP_MIN_M`, `CTAPP_LOG_M`) is unchanged.
+With v5, each boundary creates ONE `CtappBoundary` sized `CTAPP_MAX_M` on the first forward with a valid M (collective; the device
+sync + TP barrier guard is kept around creation) and uses it for every M <= max_M with M % 128 == 0; the stock path otherwise
+(decode, odd lengths, the M = 16640 profile run). Memory per GPU at max_M 8192: boundary B 424 MiB (inbox 128 + x 2 x 128 + out 40),
+A 608 MiB (out 224): ~1.0 GiB; 2.1 GiB at 16384. Eager only (the plugin runs with `enforce_eager`); `warmup()` once per instance.
+Boundary B (down -> norm -> QKV): `fusion="pdl"`, no steal, tile 256, producer raster 1 / swizzle 1 with the panel-major tail
+(`down_tail="auto"`), R = 4. Boundary A (o_proj -> norm -> gate_up): `fusion="pdl"`, steal, tile 256, consumer raster 1 / swizzle 2.
+
+### Correctness (4-layer config, rank 0, `--rescale 1`)
+
+Per-layer rel err of the boundary output vs the stock computation of the same layer (`CTAPP_CHECK=1`), and the first generated
+token / top-20 logprobs vs stock (`bench/vllm_ctapp_check.py --compare`; the stock run of this session is bit-identical to Phase 5's):
+
+| run | B qkv rel err (0->1 / 1->2 / 2->3) | B x rel err | A g rel err (layers 0-3) | A x rel err | top-1 | top-20 overlap | max abs dlogprob |
+|---|---|---|---|---|---|---|---|
+| v5 down-only | 3.727e-3 / 3.601e-3 / 3.512e-3 | 2.51e-3 / 2.33e-3 / 2.20e-3 | - | - | 124749 = stock | 20/20 | 1.56e-2 |
+| v5 both | 3.732e-3 / 3.602e-3 / 3.517e-3 | 2.51e-3 / 2.33e-3 / 2.20e-3 | 2.687e-3 / 2.722e-3 / 2.748e-3 / 2.784e-3 | 8.4e-4 - 9.7e-4 | 124749 = stock | 20/20 | 3.12e-2 |
+| Phase 5 v3 down / both (reference) | 3.85e-3 - 3.22e-3 | 2.06e-3 - 1.76e-3 | 2.60e-3 - 2.67e-3 | 5.9e-4 - 6.9e-4 | 124749 | 20/20 | 1.57e-2 / 3.13e-2 |
+| v5 both, M = 8192 (one 8192-token prompt, instance at max_M) | 3.732e-3 / 3.601e-3 / 3.517e-3 | 2.52e-3 / 2.33e-3 / 2.21e-3 | 2.642e-3 - 2.732e-3 | 7.2e-4 - 8.5e-4 | 24006 = stock | 19/20 (rank-20 tie: stock 109957, ours 64787) | 1.58e-2 |
+| v5 both, b = 2 (two 4096-token prompts, two M = 4096 steps) | 3.731e-3 - 3.513e-3 | 2.52e-3 - 2.20e-3 | 2.686e-3 - 2.784e-3 | 8.4e-4 - 9.8e-4 | 124749 / 24006 = stock | 20/20, 19/20 | 3.13e-2 / 1.57e-2 |
+| Phase 5 v3, M = 8192 / b = 2 (reference) | | | | | 24006 / 124749, 24006 | 20/20 / 20/20, 19/20 | 1.57e-2 / 1.57e-2 |
+
+Logs `build/logs/ck_s4_*.log`, JSON `build/ck_s4_*.json`. The dlogprob values are one or two bf16 ulps at logprob ~ -7.5 (ulp 0.0156-0.031), identical to Phase 5.
+
+### Ablation: 80 layers, TP4, `llm.generate` median ms (min) of 20 iterations, 3 warm-up
+
+Node1 is shared (a co-tenant 2-GPU job) and drifts up to ~5 % over a session, so the b=1 variants were run interleaved in four
+rounds within 35 minutes, with stock eager at the start and end of each round. JSON: `build/vllm_prefill_<variant>_s4<round>.json`,
+logs `build/logs/s4_pf_*.log`, status `build/logs/s4_pf_status.log`. Gain = 1 - variant / stock eager (mean of the eager runs of the
+same rounds).
+
+b = 1, M = 4096, per round:
+
+| variant | round a/b | round c/d | round e/f | round h | round i/j | mean | gain vs eager |
+|---|---|---|---|---|---|---|---|
+| stock eager (before / after) | 289.56 / 290.23 | 290.76 / 293.78 | 291.15 / 293.22 | 288.94 | 293.55 / 292.65 | **291.5** | - |
+| compiled async-TP (stock) | 275.91 | - | 280.95 | 276.32 | 278.35 | **277.9** | 4.7 % |
+| ctapp v5 pdl down-only, R=4 | 280.29 | 281.22 | 280.69 (max_M 16384) | - | 283.42 | **281.4** | 3.5 % |
+| ctapp v5 pdl both (A steal), R=4 | 279.72 | 281.06 | 281.12 (max_M 16384) | 279.63 | 282.63 | **280.8** | 3.7 % |
+| ctapp v3 down-only, R=8 (Phase 5 config) | 280.32 | 281.62 | - | - | - | **281.0** | 3.6 % |
+
+One-off variants in round c/d (same-round eager 290.76 / 293.78):
+
+| variant (b=1) | median (min) | note |
+|---|---|---|
+| v5 oproj-only (A only, steal) | 290.91 (286.24) | A alone is break-even (Phase 5 v3: 297.9 vs 289.9) |
+| v5 both, A without steal | 300.05 (295.26) | stealing is required at A (+19 ms without) |
+| v5 both, B tile 128 | 281.81 (272.79) | = tile 256 |
+| v5 down-only, fusion pdl1 | 282.04 (277.25) | = pdl |
+| v5 down-only, fusion none (3 kernels) | 282.60 (276.05) | PDL worth ~1.4 ms of 281 |
+
+Batch 1, 2, 4 (round e/f, one run each, ctapp with `--max-m 16384` so the M = 8192 / 12288 chunked-prefill steps also use the
+boundary; eager is the mean of the round's two runs 291.2 / 293.2, 579.6 / 579.5, 1144.5 / 1147.8):
+
+| variant | b=1 (M=4096) | b=2 | b=4 | gain b=1 / 2 / 4 |
+|---|---|---|---|---|
+| stock eager | 292.2 | 579.6 | 1146.2 | - |
+| compiled async-TP | 280.95 (274.37) | 547.39 (529.38) | 1062.20 (1033.15) | 3.8 / 5.6 / 7.3 % |
+| ctapp v5 down-only | 280.69 (276.85) | 552.61 (545.91) | 1093.86 (1086.37) | 3.9 / 4.7 / 4.6 % |
+| ctapp v5 both | 281.12 (277.10) | 556.82 (550.02) | 1110.78 (1098.95) | 3.8 / 3.9 / 3.1 % |
+
+Sequence 8192, b = 1 (round g, M = 8192 = max_M): stock eager 597.77, compiled async-TP 541.74 (9.4 %), v5 down-only 567.72
+(5.0 %), v5 both 577.62 (3.4 %).
+
+### Profile (torch profiler, rank 0, `bench/vllm_prof.py`, M = 4096; `build/prof/s4_*`, summaries `build/logs/s4_prof_*.txt`)
+
+Boundary kernel sequence, v5 down-only, 4-layer config (median of the 3 boundaries of the middle forward), all on the compute stream
+except the reducer: `tp4_step_kernel` (grid 4, 1.6 us) -> producer `GemmUniversalCtapp` mode 7 (grid 128, 731.6 us) || reducer
+`tp4_reduce5w_kernel<1024>` (grid 4, side stream, starts 1 us after the producer, 786.5 us, ends 53 us after the producer) ->
+consumer `GemmUniversalCtapp` mode 5 (grid [1,128], 269.6 us), which starts 11 us BEFORE the producer kernel ends (PDL: it launches as
+the producer's CTAs retire) and ends 258 us after it. No host gaps: every kernel starts 1-5 us after its stream predecessor.
+
+Per-boundary time (act_and_mul end -> QKV end for B, o_proj start -> gate_up end for A; ms):
+
+| | 4-layer: stock | 4-layer: v5 | 80-layer: stock | 80-layer: v5 both | Phase 5 (4-layer) |
+|---|---|---|---|---|---|
+| boundary B | 1.246 (down 0.612 + AR 0.320 + add-norm 0.091 + QKV 0.214) | **0.994** (producer 0.732, consumer tail 0.258) | 1.299 | **1.129** (producer 0.814, consumer 0.322) | v3 1.12, stock 1.32 |
+| boundary A | 1.819 (o_proj 0.167 + AR 0.315 + add-norm 0.093 + gate_up 1.230) | 1.803 (producer 0.317, reducer ends +0.078, consumer 1.476) | 1.885 | 1.907 (producer 0.350, consumer 1.564) | v3 2.01, stock 1.83 |
+| layer period (attention to attention) | 3.285-3.289 | 3.03-3.04 (down-only) | 3.434 (median) | 3.309 (median) | |
+| GPU time of the forward | 15.5 | 15.6 (the first all-reduce absorbs 1.29 ms of rank skew vs 0.68 in stock) | 277.0 | 265.4 (255.5-265.4 over 6 steps) | |
+
+So the boundary-B saving is 0.25 ms in the 4-layer profile but only 0.17 ms at 80 layers, and A is break-even (-0.02 ms): 79 x 0.17
+- 80 x 0.02 = 11.7 ms of GPU time, which matches the measured 277.0 - 265.4 ms and the ~10-11 ms end-to-end gain.
+
+**Why the 80-layer kernels are slower: the 700 W power cap.** SM clock and board power sampled every 100 ms with `nvidia-smi` during
+the b=1 runs (busy samples, util >= 50 %, 4 GPUs; `build/logs/s4_smi_*.csv`):
+
+| variant | median power | SM clock median (mean, p10) | median ms |
+|---|---|---|---|
+| stock eager | 689 W | 1680 MHz (1704, 1590) | 288.94 |
+| ctapp v5 both | 690 W | **1470 MHz** (1529, 1395) | 279.63 |
+| compiled async-TP | 685 W | 1515 MHz (1584, 1410) | 276.32 |
+
+Every variant runs at the 700 W limit for the whole prefill (max clock 1980 MHz). Overlapping communication with the GEMMs removes
+the low-power all-reduce phases, so the same energy is spent in less time and the GPU clocks down 12 % further than stock. The
+4-layer profile (15 ms bursts with idle gaps) does not hit the cap, which is why it overstates the gain: our producer goes from
+0.73 to 0.81 ms (+11 %) and consumer from 0.27 to 0.32 ms (+20 %) between the 4- and 80-layer runs, against +4-5 % for stock's
+cuBLAS GEMMs. Attention, which follows our boundary, is also slower in our run (159 vs 139 us).
+
+### Conclusion (Phase 6)
+
+**The Phase 6 success criterion is not met.** At 4K prefill both boundaries are 3.7 % faster than stock eager (280.8 vs 291.5 ms,
+target >= 8 %) and 1.0 % slower than vLLM's compiled async-TP (277.9). At b = 4 and at 8K tokens async-TP pulls further ahead (7.3 %
+and 9.4 % vs our 3.1-4.6 % and 3.4-5.0 %).
+
+What changed from Phase 5:
+- The protocol: unicast panel ownership instead of multimem, one instance for all M, R = 4 instead of 8, PDL consumer launch, the
+  panel-major tail order and work stealing on A. In the micro-bench boundary B went from 1.084-1.090 (v3) to 1.064-1.074 ms, A
+  from 2.15 to 1.88 ms.
+- End to end, boundary B is unchanged: v5 down-only 281.4 vs v3 down-only 281.0 ms in the same rounds, within noise.
+- Boundary A went from a loss to break-even: oproj-only 290.9 vs 297.9 in Phase 5; "both" 280.8 vs Phase 5's 288-293, now equal to
+  down-only. That is entirely the steal mode (300.05 without it).
+
+The measured ceiling and why:
+1. **GEMMs at peak.** In situ boundary B is producer + consumer, with the reduction off the critical path (the reducer ends 36-53 us
+   after the producer, inside the consumer's first wave). The floor is the two GEMMs.
+2. **Producer scatter penalty.** The mode-7 producer is 0.73 ms vs cuBLAS 0.61 ms in the same 4-layer trace: wave-synchronous NVLink
+   egress of the remote TMA stores, ~0.09 ms of the 0.12. The consumer runs 0.27 vs 0.21 ms (128 SMs, panel waits).
+3. **Boundary A is consumer-bound.** gate_up runs 1.48-1.56 ms in situ vs cuBLAS 1.23-1.26, more than the 0.41 ms all-reduce + norm it
+   hides. This cannot win without a faster gate_up GEMM.
+4. **The power cap.** At 700 W the overlapped boundary runs at 12 % lower SM clocks than stock. That turns the 0.25 ms/boundary
+   saving seen in short traces into 0.17 ms over 80 layers, i.e. ~11 ms of 291 instead of ~20.
+
+Compiled async-TP (SP + fused GEMM reduce-scatter / all-gather) is subject to the same cap and also fuses everything else through
+torch.compile. Our plugin is eager-only, so the remaining 1 % gap at b=1 is not attributable to the boundary alone.
 
 ## Reproduce
 
@@ -168,8 +312,12 @@ uv pip install -e vllm_plugin                                 # registers the ct
 export CUDA_MODULE_LOADING=LAZY
 /tmp/run4v.sh 0,1,2,3 python bench/vllm_prefill.py --variant eager
 /tmp/run4v.sh 0,1,2,3 python bench/vllm_prefill.py --variant compiled_asynctp
-/tmp/run4v.sh 0,1,2,3 python bench/vllm_prefill.py --variant ctapp --boundary down --r 8
-/tmp/run4v.sh 0,1,2,3 python bench/vllm_prefill.py --variant ctapp --boundary both --r 12 --iters 20
+# Phase 6 (plugin default CTAPP_PROTO=v5, fusion pdl, R=4, A steal): add --proto/--fusion/--steal/--qkv-tile/--max-m/--tag
+/tmp/run4v.sh 0,1,2,3 python bench/vllm_prefill.py --variant ctapp --boundary both --r 4 --proto v5 --fusion pdl --batch 1 --iters 20
+/tmp/run4v.sh 0,1,2,3 python bench/vllm_prefill.py --variant ctapp --boundary down --r 4 --proto v5 --fusion pdl --batch 1 --iters 20
+# Phase 5 configs (multimem protocol) now need --proto v3
+/tmp/run4v.sh 0,1,2,3 python bench/vllm_prefill.py --variant ctapp --boundary down --r 8 --proto v3
+/tmp/run4v.sh 0,1,2,3 python bench/vllm_prefill.py --variant ctapp --boundary both --r 12 --proto v3 --iters 20
 # correctness (4-layer config)
 CTAPP_VLLM=0 /tmp/run4v.sh 0,1,2,3 python bench/vllm_ctapp_check.py --lens 4096 --out build/ck_stock.json
 CTAPP_VLLM=1 CTAPP_CHECK=1 /tmp/run4v.sh 0,1,2,3 python bench/vllm_ctapp_check.py --lens 4096 --out build/ck_ctapp.json
@@ -178,4 +326,4 @@ python bench/vllm_ctapp_check.py --compare build/ck_stock.json build/ck_ctapp.js
 CTAPP_VLLM=1 /tmp/run4v.sh 0,1,2,3 python bench/vllm_prof.py --out build/prof/ctapp
 ```
 
-Variants of `bench/vllm_prefill.py`: eager, compiled, compiled_fi, compiled_asynctp, compiled_fi_big, ctapp (`--r`, `--boundary both|down|oproj`; `--seq`, `--batch 1,2,4`, `--iters`, `--warmup`).
+Variants of `bench/vllm_prefill.py`: eager, compiled, compiled_fi, compiled_asynctp, compiled_fi_big, ctapp (`--r`, `--boundary both|down|oproj`, `--proto v3|v5`, `--fusion none|pdl|pdl1|role`, `--steal 0|1`, `--qkv-tile 128|256`, `--max-m`; `--seq`, `--batch 1,2,4`, `--iters`, `--warmup`, `--tag` suffix for the JSON name).

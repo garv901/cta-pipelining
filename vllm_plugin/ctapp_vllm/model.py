@@ -2,6 +2,11 @@
   A: o_proj -> all-reduce -> residual add -> post_attention_layernorm -> gate_up_proj   (same layer)
   B: down_proj -> all-reduce -> residual add -> next input_layernorm -> next qkv_proj   (layers 0..78 -> 1..79)
 Env CTAPP_BOUNDARY = both (default) | down (B only) | oproj (A only).
+Env CTAPP_PROTO = v5 (default; Phase 6 panel-ownership unicast protocol, ONE instance per boundary sized CTAPP_MAX_M serves
+every M <= CTAPP_MAX_M with M % 128 == 0) | v3 (Phase 5 multimem protocol, one instance per M).
+v5 only: CTAPP_FUSION = none | pdl (default) | pdl1 | role; CTAPP_STEAL = 0 | 1 (unset: A 1, B 0; set: both boundaries);
+CTAPP_QKV_TILE = 256 (default) | 128 (boundary B consumer tile; A always 256); CTAPP_R default 4 (v3: per-M rule).
+CTAPP_MAX_M default 8192 (larger M -> stock path). Eager only (enforce_eager): no CUDA graphs.
 RMSNorm gammas are folded IN PLACE into the consumer weights (gate_up, qkv) at setup, so every stock-path norm in this
 forward uses a ones-weight RMSNorm (self._ones_norm). Call model._refold() (sets _folded=False) after re-initialising weights."""
 import copy
@@ -23,7 +28,9 @@ class CtappLlamaModel(LlamaModel):
         super().__init__(vllm_config=vllm_config, prefix=prefix, layer_type=layer_type)
         self._ctapp_enabled = (get_tensor_model_parallel_world_size() == 4 and get_pp_group().world_size == 1
                                and self.config.hidden_size == 8192 and abs(self.config.rms_norm_eps - 1e-5) < 1e-12)
-        self._max_M = int(os.environ.get("CTAPP_MAX_M", "16384"))
+        self._proto = os.environ.get("CTAPP_PROTO", "v5")
+        assert self._proto in ("v3", "v5"), self._proto
+        self._max_M = int(os.environ.get("CTAPP_MAX_M", "8192"))
         self._min_M = int(os.environ.get("CTAPP_MIN_M", "512"))
         self._R = int(os.environ["CTAPP_R"]) if os.environ.get("CTAPP_R") else None
         self._check = os.environ.get("CTAPP_CHECK", "0") == "1"
@@ -33,6 +40,7 @@ class CtappLlamaModel(LlamaModel):
         self._pool_a = None    # boundary A
         self._folded = False
         self._printed_ck = False
+        self._seen_M = set()
         if not self._ctapp_enabled:
             logger.warning("ctapp_vllm: boundary disabled for this model/config (needs TP4, PP1, hidden 8192, eps 1e-5)")
 
@@ -46,14 +54,22 @@ class CtappLlamaModel(LlamaModel):
         KrA, N2rA = l0.self_attn.o_proj.weight.shape[1], l0.mlp.gate_up_proj.weight.shape[0]
         gn = get_tp_group().device_group.group_name
         rk, ws = get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
+        kwa, kwb = {}, {}
+        b_tile = 256
+        if self._proto == "v5":   # Phase 6 S3 recommendation: B = pdl, tile 256, no steal; A = pdl + steal (tail auto, R=4 both)
+            fusion = os.environ.get("CTAPP_FUSION", "pdl")
+            st = os.environ.get("CTAPP_STEAL")
+            b_tile = int(os.environ.get("CTAPP_QKV_TILE", "256"))
+            kwb = dict(protocol="v5", max_M=self._max_M, fusion=fusion, qkv_tile=b_tile, steal=bool(int(st)) if st else False)
+            kwa = dict(protocol="v5", max_M=self._max_M, fusion=fusion, qkv_tile=256, steal=bool(int(st)) if st else True)
         self._pool = CtappBoundaryPool(Kr, N2r, rk, ws, gn, device, R=self._R, min_M=self._min_M, max_instances=6,
                                        qkv_raster=int(os.environ.get("CTAPP_B_RASTER", 2)),
-                                       qkv_swizzle=int(os.environ.get("CTAPP_B_SWIZZLE", 1)))
+                                       qkv_swizzle=int(os.environ.get("CTAPP_B_SWIZZLE", 2 if b_tile == 128 else 1)), **kwb)
         self._pool_a = CtappBoundaryPool(KrA, N2rA, rk, ws, gn, device, R=self._R, min_M=self._min_M, max_instances=6,
                                          qkv_raster=int(os.environ.get("CTAPP_A_RASTER", 1)),
-                                         qkv_swizzle=int(os.environ.get("CTAPP_A_SWIZZLE", 2)))
-        logger.warning("ctapp_vllm rank %d: setup done (mode=%s B: Kr=%d N2r=%d, A: Kr=%d N2r=%d, R=%s group=%s)",
-                       rk, self._mode, Kr, N2r, KrA, N2rA, self._R, gn)
+                                         qkv_swizzle=int(os.environ.get("CTAPP_A_SWIZZLE", 2)), **kwa)
+        logger.warning("ctapp_vllm rank %d: setup done (mode=%s proto=%s max_M=%d B: Kr=%d N2r=%d %s, A: Kr=%d N2r=%d %s, R=%s group=%s)",
+                       rk, self._mode, self._proto, self._max_M, Kr, N2r, kwb, KrA, N2rA, kwa, self._R, gn)
 
     @torch.no_grad()
     def _fold(self, layers=None):
@@ -104,7 +120,8 @@ class CtappLlamaModel(LlamaModel):
             if not use or M > self._max_M:
                 pools[name] = None
                 continue
-            new_M = M not in pool._inst and M % 128 == 0 and M >= self._min_M
+            ok_M = M % 128 == 0 and M >= self._min_M
+            new_M = ok_M and (not pool._inst if self._proto == "v5" else M not in pool._inst)   # v5: one max_M instance
             if new_M:
                 torch.cuda.synchronize()
                 get_tp_group().barrier()
@@ -113,9 +130,11 @@ class CtappLlamaModel(LlamaModel):
                 torch.cuda.synchronize()
                 get_tp_group().barrier()
                 if rank == 0:
-                    logger.warning("ctapp_vllm created boundary %s instance for M=%d", name, M)
+                    logger.warning("ctapp_vllm created boundary %s instance for M=%d (proto %s, max_M %d)", name, M, self._proto,
+                                   self._max_M)
         ba, b = pools["A"], pools["B"]
-        if rank == 0 and (M not in self._pool._inst or os.environ.get("CTAPP_LOG_M") == "1"):
+        if rank == 0 and (M not in self._seen_M or os.environ.get("CTAPP_LOG_M") == "1"):
+            self._seen_M.add(M)
             logger.warning("ctapp_vllm forward M=%d -> A:%s B:%s", M, ba is not None, b is not None)
         if self._check and rank == 0 and ba is None and b is None:
             logger.warning("CTAPP_CHECK M=%d -> stock fallback (no boundary)", M)

@@ -38,8 +38,104 @@ once("      else if (producer_warp_role == ProducerWarpRole::MainloopAux) {\n   
 #    then never completes (kernel hangs even in mode 0). The reducer path (tp4::reduce_slice64) must therefore stay <= 40
 #    registers; the standalone mm_reduce_probe_kernel in gemm_tp4.cu reports its footprint (31 with kRedBatch = 2).
 # 7. PDL: mode 2 syncs on its own panel counters, so it must not wait for the primary grid to finish
+# 9b. (Phase 6 S3) neither do the v5 consumers: mode 5 (PDL dependent of the producer, Variant A') and mode 8 (role-switching
+#     consumer, Variant B) wait per panel on value flags; nor the mode-7 producer, which in the single-stream "pdl1" chain is the
+#     PDL dependent of the (spinning) reducer kernel: it needs nothing from it (tp4_step, its real predecessor, completed before
+#     the reducer launched). Elsewhere mode 7 is launched without the PDL attribute, where griddepcontrol.wait is a no-op.
 _old = "cutlass::arch::wait_on_dependent_grids();"
 assert s.count(_old) == 3, s.count(_old)
-s = s.replace(_old, "if (params.ctapp.mode != 2) cutlass::arch::wait_on_dependent_grids();")
+s = s.replace(_old, "if (params.ctapp.mode != 2 && params.ctapp.mode != 5 && params.ctapp.mode != 7 && params.ctapp.mode != 8) cutlass::arch::wait_on_dependent_grids();")
+# 8. Phase-6 producer scatter (mode 7, v5 protocol): tile (m, n) is TMA-stored into the inbox of owner rank m % world at row block
+#    m / world. Compiled in only for instances with CtappScatter_ = true (the down-proj GEMM); one epilogue Params (TMA store
+#    descriptor) per destination rank, selected per tile; the epilogue collective is just Params const& + smem, so it is
+#    constructed per tile. Other modes take the stock store() call unchanged.
+once("  class TileSchedulerTag_\n>\nclass GemmUniversalCtapp\n{", "  class TileSchedulerTag_,\n  bool CtappScatter_ = false\n>\nclass GemmUniversalCtapp\n{")
+once("  using ProblemShape = ProblemShape_;\n", "  using ProblemShape = ProblemShape_;\n  static constexpr bool CtappScatter = CtappScatter_;   // mode-7 producer scatter compiled in\n")
+once("    CtappTp4Params ctapp{};\n    void* workspace{nullptr};\n  };",
+     "    CtappTp4Params ctapp{};\n    void* workspace{nullptr};\n    EpilogueParams epi_dst[4]{};   // mode 7: epilogue (TMA store into the owner's inbox slot) per destination rank\n  };")
+once("    return {\n      args.mode,", "    Params ctapp_out {\n      args.mode,")
+once("      args.ctapp,\n      workspace\n    };\n",
+     "      args.ctapp,\n      workspace\n    };\n"
+     "    if constexpr (CtappScatter) {\n"
+     "      if (args.ctapp.mode == 7) {\n"
+     "        ProblemShape shape_dst = args.problem_shape;   // (dst_rows, N, K, L): the destination inbox slot\n"
+     "        get<0>(shape_dst) = args.ctapp.dst_rows;\n"
+     "        for (int i = 0; i < 4; ++i) {\n"
+     "          EpilogueArguments ea = args.epilogue;\n"
+     "          ea.ptr_D = static_cast<decltype(ea.ptr_D)>(args.ctapp.dst_ptr[i]);\n"
+     "          ctapp_out.epi_dst[i] = CollectiveEpilogue::to_underlying_arguments(shape_dst, ea, epilogue_workspace);\n"
+     "        }\n"
+     "      }\n"
+     "    }\n"
+     "    return ctapp_out;\n")
+once("      CollectiveEpilogue::prefetch_tma_descriptors(params.epilogue);\n",
+     "      CollectiveEpilogue::prefetch_tma_descriptors(params.epilogue);\n"
+     "      if constexpr (CtappScatter) {\n"
+     "        if (params.ctapp.mode == 7) {\n"
+     "          CUTLASS_PRAGMA_UNROLL\n"
+     "          for (int i = 0; i < 4; ++i) CollectiveEpilogue::prefetch_tma_descriptors(params.epi_dst[i]);\n"
+     "        }\n"
+     "      }\n")
+once("        if (TileScheduler::compute_epilogue(work_tile_info, params.scheduler)) {\n          // Epilogue and write to gD\n",
+     "        if (TileScheduler::compute_epilogue(work_tile_info, params.scheduler)) {\n"
+     "          if (CtappScatter && params.ctapp.mode == 7) {\n"
+     "            // mode 7: owner = m % world; store at row block m / world of the owner's inbox slot (dst_rows x N)\n"
+     "            const int tp4_owner = work_tile_info.M_idx % params.ctapp.world;\n"
+     "            CollectiveEpilogue tp4_epi(params.epi_dst[tp4_owner], shared_storage.tensors.epilogue);\n"
+     "            auto tp4_shape = problem_shape_MNKL;\n"
+     "            get<0>(tp4_shape) = params.ctapp.dst_rows;\n"
+     "            auto tp4_coord = make_coord(idx2crd(work_tile_info.M_idx / params.ctapp.world, shape<2>(gA_mkl)), n_coord, _, l_coord);\n"
+     "            auto [tp4_load_next, tp4_store_next] =\n"
+     "            tp4_epi.store(\n"
+     "              epi_load_pipeline,\n"
+     "              epi_load_pipe_consumer_state,\n"
+     "              epi_store_pipeline,\n"
+     "              epi_store_pipe_producer_state,\n"
+     "              tp4_shape,\n"
+     "              blk_shape,\n"
+     "              tp4_coord,\n"
+     "              accumulators,\n"
+     "              tiled_mma,\n"
+     "              mma_thread_idx,\n"
+     "              shared_storage.tensors.epilogue,\n"
+     "              work_tile_info.reduction_subtile_idx()\n"
+     "            );\n"
+     "            epi_load_pipe_consumer_state = tp4_load_next;\n"
+     "            epi_store_pipe_producer_state = tp4_store_next;\n"
+     "            do_store_tail = true;\n"
+     "          }\n"
+     "          else {\n"
+     "          // Epilogue and write to gD\n")
+once("          do_store_tail = true;\n        }\n        tp4_after_store(", "          do_store_tail = true;\n          }\n        }\n        tp4_after_store(")
+# 9. Phase-6 S3: 2-kernel boundary via programmatic dependent launch (PDL; needs -DCUTLASS_ENABLE_GDC_FOR_SM90).
+# 9a. producer trigger: with ctapp.pdl_trigger every CTA executes griddepcontrol.launch_dependents right after the prologue
+#     __syncthreads (before setmaxnreg), so the dependent grid launches as soon as all producer CTAs are resident. The stock
+#     last-tile trigger stays. Also the CTAPP_TRACE "prologue done" stamp.
+once("    // Wait for all thread blocks in the Cluster\n    cluster_wait_fn();\n",
+     "    // Wait for all thread blocks in the Cluster\n    cluster_wait_fn();\n"
+     "    if (params.ctapp.pdl_trigger) cutlass::arch::launch_dependent_grids();   // ctapp patch 9a\n"
+     "    if (thread_idx == 0) tp4_trace(params.ctapp, 1);\n")
+# 9c. role-switch preamble (mode 8, compiled in for CtappRole_ = true instances only: the QKV consumers), at the very top of
+#     operator() after the role ids and before the TMA prefetch / pipeline init, i.e. under the full __launch_bounds__(384, 1)
+#     register budget: the first R CTAs to arrive run the v5 owner reducer (tp4_role_preamble in ctapp_tp4.cuh), then every CTA
+#     falls through into the stock prologue. Also the CTAPP_TRACE "CTA entry" stamp.
+once("  bool CtappScatter_ = false\n>\nclass GemmUniversalCtapp\n{", "  bool CtappScatter_ = false,\n  bool CtappRole_ = false\n>\nclass GemmUniversalCtapp\n{")
+once("  static constexpr bool CtappScatter = CtappScatter_;   // mode-7 producer scatter compiled in\n",
+     "  static constexpr bool CtappScatter = CtappScatter_;   // mode-7 producer scatter compiled in\n"
+     "  static constexpr bool CtappRole = CtappRole_;         // mode-8 role-switch preamble compiled in\n")
+once("    // Issue Tma Descriptor Prefetch from a single thread\n",
+     "    if (thread_idx == 0) tp4_trace_entry(params.ctapp);\n"
+     "    if constexpr (CtappRole) {   // ctapp patch 9c\n"
+     "      if (params.ctapp.mode == 8) tp4_role_preamble(params.ctapp, reinterpret_cast<int*>(smem_buf));\n"
+     "    }\n\n"
+     "    // Issue Tma Descriptor Prefetch from a single thread\n")
+# 10. Phase-6 S3 producer tile order "panel-major tail" (ctapp.tail_cols > 0, tp4_remap_tile in ctapp_tp4.cuh): every work tile
+#     the static persistent scheduler hands out (initial and each fetch, in all warp roles) is remapped in place, so the TMA
+#     loads, MMA, epilogue coordinates, scatter owner and flags all see the same (m, n). The scheduler's own state is its linear
+#     index, so editing M_idx / N_idx does not perturb the walk.
+for _old in ("work_tile_info = next_work_tile_info;", "work_tile_info = scheduler.initial_work_tile_info(ClusterShape{});"):
+    _n = s.count(_old)
+    assert _n == {"work_tile_info = next_work_tile_info;": 7}.get(_old, 2), (_n, _old)
+    s = s.replace(_old, _old + " tp4_remap_tile(params.ctapp, work_tile_info);   // ctapp patch 10")
 open(DST, "w").write(s)
 print("wrote", DST, len(s.splitlines()), "lines")

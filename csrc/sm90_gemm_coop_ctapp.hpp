@@ -57,7 +57,9 @@ template <
   class ProblemShape_,
   class CollectiveMainloop_,
   class CollectiveEpilogue_,
-  class TileSchedulerTag_
+  class TileSchedulerTag_,
+  bool CtappScatter_ = false,
+  bool CtappRole_ = false
 >
 class GemmUniversalCtapp
 {
@@ -66,6 +68,8 @@ public:
   // Type Aliases
   //
   using ProblemShape = ProblemShape_;
+  static constexpr bool CtappScatter = CtappScatter_;   // mode-7 producer scatter compiled in
+  static constexpr bool CtappRole = CtappRole_;         // mode-8 role-switch preamble compiled in
   static_assert(cute::rank(ProblemShape{}) == 3 or cute::rank(ProblemShape{}) == 4,
     "ProblemShape{} should be <M,N,K> or <M,N,K,L>");
 
@@ -201,6 +205,7 @@ public:
     TileSchedulerParams scheduler{};
     CtappTp4Params ctapp{};
     void* workspace{nullptr};
+    EpilogueParams epi_dst[4]{};   // mode 7: epilogue (TMA store into the owner's inbox slot) per destination rank
   };
 
   //
@@ -267,7 +272,7 @@ public:
       problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles
       );
 
-    return {
+    Params ctapp_out {
       args.mode,
       problem_shape,
       CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, mainloop_workspace),
@@ -277,6 +282,18 @@ public:
       args.ctapp,
       workspace
     };
+    if constexpr (CtappScatter) {
+      if (args.ctapp.mode == 7) {
+        ProblemShape shape_dst = args.problem_shape;   // (dst_rows, N, K, L): the destination inbox slot
+        get<0>(shape_dst) = args.ctapp.dst_rows;
+        for (int i = 0; i < 4; ++i) {
+          EpilogueArguments ea = args.epilogue;
+          ea.ptr_D = static_cast<decltype(ea.ptr_D)>(args.ctapp.dst_ptr[i]);
+          ctapp_out.epi_dst[i] = CollectiveEpilogue::to_underlying_arguments(shape_dst, ea, epilogue_workspace);
+        }
+      }
+    }
+    return ctapp_out;
   }
 
   static bool
@@ -408,10 +425,21 @@ public:
     int lane_predicate = cute::elect_one_sync();
     uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
 
+    if (thread_idx == 0) tp4_trace_entry(params.ctapp);
+    if constexpr (CtappRole) {   // ctapp patch 9c
+      if (params.ctapp.mode == 8) tp4_role_preamble(params.ctapp, reinterpret_cast<int*>(smem_buf));
+    }
+
     // Issue Tma Descriptor Prefetch from a single thread
     if ((warp_idx == 0) && lane_predicate) {
       CollectiveMainloop::prefetch_tma_descriptors(params.mainloop);
       CollectiveEpilogue::prefetch_tma_descriptors(params.epilogue);
+      if constexpr (CtappScatter) {
+        if (params.ctapp.mode == 7) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < 4; ++i) CollectiveEpilogue::prefetch_tma_descriptors(params.epi_dst[i]);
+        }
+      }
     }
 
     CollectiveEpilogue collective_epilogue(params.epilogue, shared_storage.tensors.epilogue);
@@ -556,9 +584,11 @@ public:
 
     // Wait for all thread blocks in the Cluster
     cluster_wait_fn();
+    if (params.ctapp.pdl_trigger) cutlass::arch::launch_dependent_grids();   // ctapp patch 9a
+    if (thread_idx == 0) tp4_trace(params.ctapp, 1);
 
     if (warp_group_role == WarpGroupRole::Producer) {
-      work_tile_info = scheduler.initial_work_tile_info(ClusterShape{});
+      work_tile_info = scheduler.initial_work_tile_info(ClusterShape{}); tp4_remap_tile(params.ctapp, work_tile_info);   // ctapp patch 10
       cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
       // Scheduler Producer Warp
@@ -567,7 +597,7 @@ public:
           bool requires_clc_query = true;
           TileSchedulerPipelineState scheduler_pipe_producer_state = cutlass::make_producer_start_state<TileSchedulerPipeline>();
 
-          if (params.ctapp.mode != 2) cutlass::arch::wait_on_dependent_grids();
+          if (params.ctapp.mode != 2 && params.ctapp.mode != 5 && params.ctapp.mode != 7 && params.ctapp.mode != 8) cutlass::arch::wait_on_dependent_grids();
           while (work_tile_info.is_valid()) {
 
             if (requires_clc_query) {
@@ -591,7 +621,7 @@ public:
               ++scheduler_pipe_consumer_state;
             }
 
-            work_tile_info = next_work_tile_info;
+            work_tile_info = next_work_tile_info; tp4_remap_tile(params.ctapp, work_tile_info);   // ctapp patch 10
           }
           scheduler_pipeline.producer_tail(scheduler_pipe_producer_state);
         } 
@@ -602,13 +632,13 @@ public:
       if (producer_warp_role == ProducerWarpRole::Mainloop) {
         // Ensure that the prefetched kernel does not touch
         // unflushed global memory prior to this instruction
-        if (params.ctapp.mode != 2) cutlass::arch::wait_on_dependent_grids();
+        if (params.ctapp.mode != 2 && params.ctapp.mode != 5 && params.ctapp.mode != 7 && params.ctapp.mode != 8) cutlass::arch::wait_on_dependent_grids();
         bool do_load_order_arrive = true;
         bool requires_clc_query = true;
         while (work_tile_info.is_valid()) {
           if (!TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
             auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
-            work_tile_info = next_work_tile_info;   
+            work_tile_info = next_work_tile_info; tp4_remap_tile(params.ctapp, work_tile_info);   // ctapp patch 10   
             continue;
           }
 
@@ -655,7 +685,7 @@ public:
                                                                             scheduler_pipe_consumer_state
                                                                            );
 
-          work_tile_info = next_work_tile_info;
+          work_tile_info = next_work_tile_info; tp4_remap_tile(params.ctapp, work_tile_info);   // ctapp patch 10
           if constexpr (IsSchedDynamicPersistent) { 
             requires_clc_query = increment_pipe; 
             if (increment_pipe) {
@@ -677,7 +707,7 @@ public:
           while (work_tile_info.is_valid()) {
             if (!TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
               auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
-              work_tile_info = next_work_tile_info;
+              work_tile_info = next_work_tile_info; tp4_remap_tile(params.ctapp, work_tile_info);   // ctapp patch 10
               continue;
             }
 
@@ -713,7 +743,7 @@ public:
               scheduler_pipe_consumer_state
             );
 
-            work_tile_info = next_work_tile_info;
+            work_tile_info = next_work_tile_info; tp4_remap_tile(params.ctapp, work_tile_info);   // ctapp patch 10
           } // Scheduler work fetch loop
 
         }
@@ -724,7 +754,7 @@ public:
 
         // Ensure that the prefetched kernel does not touch
         // unflushed global memory prior to this instruction
-        if (params.ctapp.mode != 2) cutlass::arch::wait_on_dependent_grids();
+        if (params.ctapp.mode != 2 && params.ctapp.mode != 5 && params.ctapp.mode != 7 && params.ctapp.mode != 8) cutlass::arch::wait_on_dependent_grids();
 
         if (!TileScheduler::requires_separate_reduction(params.scheduler) && work_tile_info.is_valid()) {
           load_order_barrier.wait();
@@ -759,7 +789,7 @@ public:
                                                                             scheduler_pipeline,     
                                                                             scheduler_pipe_consumer_state
                                                                            );
-          work_tile_info = next_work_tile_info;
+          work_tile_info = next_work_tile_info; tp4_remap_tile(params.ctapp, work_tile_info);   // ctapp patch 10
           if constexpr (IsSchedDynamicPersistent) { 
             if (increment_pipe) {
               ++scheduler_pipe_consumer_state;
@@ -773,7 +803,7 @@ public:
     } // Producer Warp Group End
 
     else if (warp_group_role == WarpGroupRole::Consumer0 || warp_group_role == WarpGroupRole::Consumer1) {
-      work_tile_info = scheduler.initial_work_tile_info(ClusterShape{});
+      work_tile_info = scheduler.initial_work_tile_info(ClusterShape{}); tp4_remap_tile(params.ctapp, work_tile_info);   // ctapp patch 10
       cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
       CollectiveEpilogue collective_epilogue(params.epilogue, shared_storage.tensors.epilogue);
@@ -847,6 +877,33 @@ public:
 
         tp4_before_epilogue(params.ctapp, work_tile_info.M_idx);
         if (TileScheduler::compute_epilogue(work_tile_info, params.scheduler)) {
+          if (CtappScatter && params.ctapp.mode == 7) {
+            // mode 7: owner = m % world; store at row block m / world of the owner's inbox slot (dst_rows x N)
+            const int tp4_owner = work_tile_info.M_idx % params.ctapp.world;
+            CollectiveEpilogue tp4_epi(params.epi_dst[tp4_owner], shared_storage.tensors.epilogue);
+            auto tp4_shape = problem_shape_MNKL;
+            get<0>(tp4_shape) = params.ctapp.dst_rows;
+            auto tp4_coord = make_coord(idx2crd(work_tile_info.M_idx / params.ctapp.world, shape<2>(gA_mkl)), n_coord, _, l_coord);
+            auto [tp4_load_next, tp4_store_next] =
+            tp4_epi.store(
+              epi_load_pipeline,
+              epi_load_pipe_consumer_state,
+              epi_store_pipeline,
+              epi_store_pipe_producer_state,
+              tp4_shape,
+              blk_shape,
+              tp4_coord,
+              accumulators,
+              tiled_mma,
+              mma_thread_idx,
+              shared_storage.tensors.epilogue,
+              work_tile_info.reduction_subtile_idx()
+            );
+            epi_load_pipe_consumer_state = tp4_load_next;
+            epi_store_pipe_producer_state = tp4_store_next;
+            do_store_tail = true;
+          }
+          else {
           // Epilogue and write to gD
           auto [epi_load_pipe_consumer_state_next, epi_store_pipe_producer_state_next] =
           collective_epilogue.store(
@@ -866,6 +923,7 @@ public:
           epi_load_pipe_consumer_state = epi_load_pipe_consumer_state_next;
           epi_store_pipe_producer_state = epi_store_pipe_producer_state_next;
           do_store_tail = true;
+          }
         }
         tp4_after_store(params.ctapp, work_tile_info.M_idx, work_tile_info.N_idx, tp4_prev_m, tp4_prev_n, mma_thread_idx);
 
@@ -874,7 +932,7 @@ public:
                                                                           scheduler_pipeline,
                                                                           scheduler_pipe_consumer_state
                                                                           );
-        work_tile_info = next_work_tile_info;
+        work_tile_info = next_work_tile_info; tp4_remap_tile(params.ctapp, work_tile_info);   // ctapp patch 10
         if constexpr (IsSchedDynamicPersistent) { 
           if (increment_pipe) {
             ++scheduler_pipe_consumer_state;

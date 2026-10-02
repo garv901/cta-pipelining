@@ -33,7 +33,9 @@ def load_tp4():
         name="ctapp_tp4_ext",
         sources=[f"{ROOT}/csrc/gemm_tp4.cu"],
         extra_include_paths=[f"{ROOT}/csrc", f"{ROOT}/third_party/cutlass/include", f"{ROOT}/third_party/cutlass/tools/util/include"],
-        extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-DNDEBUG", "-Xptxas", "-v"],   # -v: register/spill report in the build log
+        # -v: register/spill report in the build log. CUTLASS_ENABLE_GDC_FOR_SM90: compile the griddepcontrol (PDL) PTX into the GEMMs
+        # (cutlass/arch/grid_dependency_control.h); a no-op for kernels launched without the PDL attribute.
+        extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-DNDEBUG", "-DCUTLASS_ENABLE_GDC_FOR_SM90=1", "-Xptxas", "-v"],
         extra_cflags=["-O3", "-std=c++17"],
         extra_ldflags=["-lcuda", f"-L{CUDA}/lib64/stubs"],
         build_directory=BD4,
