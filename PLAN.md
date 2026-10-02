@@ -269,6 +269,7 @@ than micro-batching the same kernel. Confirms: all further work sits on the coop
   of after the full reduce + norm + all-gather. Fixed costs: 128-row fill of the down-proj (2*128*28672*8192/4/700T = 21 us
   per GPU), drain 23 us, protocol ~15 us, against a 1k-token ideal of 242 us: model 1.24x at M=1k (multimem 1.82x), 1.06x at
   4k (asynctp 1.28x), 1.03x at 8k (asynctp 1.22x). TP2 bring-up rung uses the same code with peer stores instead of multimem.
+- **[Superseded 2026-10-02 by the Phase 5 evidence, see "Conclusion and incorrect assumptions" at the end of this file: the claim that NVLS is the right baseline and multimem the matching mechanism at t >= 4 did not hold.]**
 - Gate for Phase 4: beat asynctp at M = 4k and 8k by >= 10 % and multimem at M = 1k-2k by >= 20 %, bit-exact vs a reference
   reduce (bf16 multimem accumulation order permitting; else rel err <= the NVLS baseline's).
 
@@ -413,4 +414,39 @@ largest remaining item at M <= 2k), cached workspace, `CtappBoundary` on this pa
 
 ### Phase 4 result (2026-10-02)
 
-Productionised path (`CtappBoundary` in `ctapp/tp4.py`): the epoch lives on the device (bumped by `add_(1)` at the start of each forward), so the forward is CUDA-graph capturable (two graphs, one per epoch parity, because the `rowss` pointer is baked into the QKV epilogue); `set_weights` runs a warm-up launch of both GEMMs because CUDA lazy module loading deadlocks (spin-limit trap) against an already-resident spinning reducer. TP4, l70b_qkv, b2b ms, best ctapp vs best baseline, gain = 1 - ctapp / best baseline: M=1024 0.344 vs 0.452 (multimem), 24 %; 2048 0.591 vs 0.663 (asynctp), 11 % (33 % vs multimem, 32 % vs Step 0's async-TP 0.867); 4096 1.070 vs 1.280, 16 %; 8192 2.284 vs 2.534, 10 %; 16384 4.764 vs 5.016, 5 %. The gate (>= 10 % over async-TP at 4k/8k, >= 20 % over multimem at 1k-2k) is met at 1k (24 % vs multimem), 4k (16 %) and 8k (10 %, marginal); at 2k it is met vs multimem and marginal vs async-TP. Full tables in `results/tp4_chain.md`.
+Productionised path (`CtappBoundary` in `ctapp/tp4.py`): the epoch lives on the device (bumped by `add_(1)` at the start of each forward), so the forward is CUDA-graph capturable (two graphs, one per epoch parity, because the `rowss` pointer is baked into the QKV epilogue); `set_weights` runs a warm-up launch of both GEMMs because CUDA lazy module loading deadlocks (spin-limit trap) against an already-resident spinning reducer. TP4, l70b_qkv, b2b ms, best ctapp vs best baseline (FlashInfer `trtllm_allreduce_fusion` added as a baseline, one self-consistent rerun), gain = 1 - ctapp / best baseline: M=1024 0.344 vs 0.344 (flashinfer), 0 % (24 % vs multimem); 2048 0.590 vs 0.658 (flashinfer), 10 % (11 % vs async-TP 0.662, 33 % vs multimem); 4096 1.053 vs 1.285 (asynctp), 18 %; 8192 2.236 vs 2.531 (asynctp), 12 %; 16384 4.754 vs 5.022 (asynctp), 5 %. The gate (>= 10 % over async-TP at 4k/8k, >= 20 % over multimem at 1k-2k) is met at 1k (24 % vs multimem), 2k, 4k (18 %) and 8k (12 %), but FlashInfer's fused all-reduce+residual+RMSNorm, the production path, ties ctapp at 1k and trails it by only 10 % at 2k. Full tables in `results/tp4_chain.md`.
+
+Known limitation (found 2026-10-02 while generalising the boundary): the standalone reducer kernels (`tp4_reduce*_kernel` in
+`csrc/ctapp_tp4.cuh`) hard-code 16 columns per thread (two bf16x8 vectors), which covers a 128x256 tile only when rows-per-rank
+= 128 / world = 32, i.e. world = 4. At world 2 half the columns of x are never reduced (x rel err ~1.0 in `tests/test_tp4.py
+--world 2`); at world 8 threads would overlap. Fix when needed: loop over `cols / 16` vector pairs per thread (or derive the
+thread->(row, col) map from `cols`). TP4 is the production target, so this is deferred.
+
+## Phase 5 (2026-10-02): vLLM port and 4K prefill ablation
+
+Built `vllm_plugin/` (package `ctapp_vllm`, enable with `CTAPP_VLLM=1`): a vLLM 0.30.0 general plugin that registers `CtappLlamaForCausalLM`, which replaces the two TP all-reduce boundaries per layer (A: o_proj -> add -> post_attention_layernorm -> gate_up; B: down_proj -> add -> next input_layernorm -> next qkv) with `CtappBoundary` from `ctapp/tp4.py`. Knobs: `CTAPP_BOUNDARY=both|down|oproj`, `CTAPP_R`, `CTAPP_A_RASTER/SWIZZLE`, `CTAPP_B_RASTER/SWIZZLE`, `CTAPP_CHECK`, `CTAPP_LOG_M`. Gammas are folded in place into gate_up/qkv (stock-path norms use a ones-weight RMSNorm); one pool instance per M; stock fallback for M not a multiple of 128 or M < 512 (decode). Correctness on a 4-layer 70B config: boundary rel err 2.6e-3 (A) and 3.2-3.8e-3 (B), identical top-1 token and top-20 logprobs vs stock.
+Benchmarks: `bench/vllm_prefill.py`, `bench/vllm_ctapp_check.py`, `bench/vllm_prof.py`; full tables in `results/vllm_prefill_4k.md`.
+
+Numbers (80 layers, TP4, b=1, M=4096, median ms of `llm.generate`): stock eager 287.5 (289.9 same-session), compiled 287.9 (FlashInfer fusion, 2 MB threshold) / 299.9 (256 MB threshold), compiled async-TP 273.1, ctapp down-only R=8 280.7, ctapp both R=8 331.4 (old A config) -> 290.6-292.6 after the A swizzle fix (R=12: 288.1-289.5), oproj-only 297.9. Down-only saves ~0.06-0.12 ms/layer at b=1 (0.4-0.5 at b=4), 3 % over eager, and loses to compiled async-TP by 3 %.
+
+Findings:
+1. Baseline: the micro-benchmark gain (1.053 vs 1.285 ms asynctp) does not translate, because the stock eager chain it replaces is cheap (boundary B 1.32 ms vs ours 1.12 ms) and the compiled async-TP also fuses everything else.
+2. GEMM efficiency: the reduction is hidden at both boundaries (reducer 0.72-0.84 ms under a 0.78 ms producer / 1.67 ms consumer), but our consumer GEMMs run 1.3-1.6x cuBLAS in situ (120-124 SMs, 128x256 tile, panel waits, reducer traffic), producer 1.25x. The gate_up consumer was 2x cuBLAS with raster 2 / swizzle 1 and is 1.06-1.13x with raster 1 / swizzle 2-8 on 1 GPU; in situ 1.37x.
+
+Next levers: (a) unicast reduce-scatter/all-gather reducer with a light flag protocol (multimem path is SM-issued, ~90 GB/s, ~0.8 ms for 64 MB vs NCCL ring 0.35 ms at 369 GB/s) so the reducer is shorter than the GEMM and R can shrink; (b) run the consumer on 132 SMs after the reducer retires and a better tile for N=14336; (c) CUDA-graph / compiled integration to remove eager overhead. Decode is out of scope (fewer than 2 row panels).
+
+Known issue: a one-off illegal-memory-access crash at pool-instance creation mid-run; worked around with a device sync + TP barrier before creation; root cause unproven.
+
+### Conclusion and incorrect assumptions
+
+Verdict: negative-to-marginal for production at TP4 (3 % over stock eager, 3 % behind compiled async-TP at 4K prefill). Three assumptions made in Step 0 / Phase 4 did not hold.
+
+1. **Baseline.** Assumption: the Step-0 "strong baselines" (torch symmetric-memory variants, torch.distributed NCCL; 64 MB all-reduce ~0.7 ms) represent what an engine pays. Evidence: vLLM's PyNccl path does the same all-reduce in 0.35-0.38 ms (`ncclDevKernel_AllReduce_Sum_bf16_RING_LL`, ~275 GB/s effective), and stock boundary B is 1.32 ms vs ours 1.12 ms. Consequence: the 18 % stand-alone gain (1.053 vs 1.285 ms) shrinks to 3 % vs eager and goes negative vs compiled async-TP.
+2. **Mechanism.** Assumption: NVLS multimem is the matching mechanism because it moves P bytes once vs 1.5 P for a ring. Evidence: SM-issued multimem reduction runs at ~90 GB/s per GPU vs 369 GB/s unicast; the reducer takes 0.72-0.84 ms for 64 MB (NCCL ring 0.35 ms), outlasts the 0.78 ms producer GEMM and occupies 8-12 SMs. Consequence: the reduction is hidden only because the GEMM is slow, R cannot shrink, and the SMs taken by the reducer slow the GEMMs.
+3. **GEMM efficiency.** Assumption: our cooperative GEMMs are close to cuBLAS when run as producer/consumer. Evidence: in situ 1.25x (producer) and 1.3-1.6x (consumers) cuBLAS time (120-124 SMs, one 128x256 tile, panel waits, reducer traffic; gate_up consumer 1.37x after the swizzle fix). Consequence: the hidden communication is spent on slower compute; boundary A is break-even at best (~2.01 ms vs 1.83 ms stock in the profile; 288-293 vs 289.9 ms end to end).
+
+**Open discrepancy (not explained).** Our bench's `nccl` variant (torch.distributed all_reduce, bf16, 64 MB) measures ~0.75 ms in BOTH venvs (torch 2.12 NCCL, and torch 2.13 with NCCL 2.29.7), while vLLM's PyNccl path shows 0.35-0.38 ms in the profiler trace (RING_LL kernel, 24 blocks). The cause (algorithm/protocol selection, communicator setup, or measurement method) is NOT established. Measure it before making any further baseline claims.
+
+**Step-0 decision superseded.** "NVLS is the right baseline and multimem the matching mechanism at t >= 4" (Step 0 section above) is superseded by the Phase 5 evidence (findings 1 and 2). It is kept in place for the record.
+
+**What would change the outcome.** (i) Go/no-go: a unicast reduce-scatter/all-gather reducer with NCCL-class bandwidth and a light flag protocol; if it cannot reach ~0.35 ms for 64 MB there is no case. (ii) Then consumer-GEMM efficiency (132 SMs after the reducer retires, better tile for N=14336).

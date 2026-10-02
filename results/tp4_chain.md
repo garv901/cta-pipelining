@@ -1,37 +1,44 @@
 # Phase 4: TP4 down-proj -> residual -> RMSNorm -> QKV on node1 (8x H100 NVSwitch)
 
+**Caveat (2026-10-02, after the vLLM port).** The baselines in this table are torch-level implementations
+(torch symmetric memory, torch.distributed NCCL, FlashInfer). vLLM's eager NCCL path does the 64 MB all-reduce in
+0.35-0.38 ms, about 2x faster than the `nccl` row here (~0.7-0.75 ms; the cause of the difference is not yet established),
+so the gains in this table overstate what is available in an engine. End to end in vLLM at 4K prefill the down boundary
+is only 3 % faster than stock eager and 3 % slower than compiled async-TP: see `results/vllm_prefill_4k.md`.
+
 Chain per layer boundary: Llama-70B down-projection (K=28672 sharded 4 ways, N=8192) -> all-reduce -> residual add -> RMSNorm -> QKV (N=10240, column-sharded). TP4, one process per GPU, bf16 with fp32 accumulate. `ideal` = 1-GPU eager cuBLAS time of the same chain / 4. exposed % = (t - ideal) / t. Back-to-back = calls queued without host sync (production condition); per-step = barrier + sync before each call. 50 iterations, 5 warm-up, max over ranks.
 
-Methods: `ctapp` = our kernel: mode-4 CUTLASS SM90 cooperative GEMM on (SMs - R) SMs signalling per-tile counters via multimem; a standalone reducer kernel v3 (R blocks: 12 for M <= 2048, 8 above; 16 worker warps + 1 signaller warp) that does the NVLS `multimem.ld_reduce` per tile, adds the residual, writes the replicated x via `multimem.st`, accumulates the row sum-of-squares and signals per 128-row panel; then the QKV GEMM (raster 2) whose CTAs wait on the panel counter and apply the RMSNorm in the epilogue. `ctapp_graph` = the same captured in CUDA graphs (two graphs by epoch parity, static input copies included in the timing). `ctapp_nowait` = the same two GEMMs on (SMs - R) SMs with no reduction = floor. `multimem` = torch symm-mem NVLS all-reduce + eager RMSNorm. `asynctp` = torch async-TP fused_matmul_reduce_scatter + RMSNorm on own rows + NCCL all-gather. `nccl` = dist.all_reduce + eager RMSNorm.
+Methods: `ctapp` = our kernel: mode-4 CUTLASS SM90 cooperative GEMM on (SMs - R) SMs signalling per-tile counters via multimem; a standalone reducer kernel v3 (R blocks: 12 for M <= 2048, 8 above; 16 worker warps + 1 signaller warp) that does the NVLS `multimem.ld_reduce` per tile, adds the residual, writes the replicated x via `multimem.st`, accumulates the row sum-of-squares and signals per 128-row panel; then the QKV GEMM (raster 2) whose CTAs wait on the panel counter and apply the RMSNorm in the epilogue. `ctapp_graph` = the same captured in CUDA graphs (two graphs by epoch parity, static input copies included in the timing). `ctapp_nowait` = the same two GEMMs on (SMs - R) SMs with no reduction = floor. `multimem` = torch symm-mem NVLS all-reduce + eager RMSNorm. `flashinfer` = eager cuBLAS down-proj, then FlashInfer `trtllm_allreduce_fusion` (pattern kARResidualRMSNorm; one kernel does all-reduce + residual add + RMSNorm and writes the new residual; fp32_acc, no PDL, oneshot/twoshot chosen by FlashInfer's heuristic), then the QKV GEMM; the reduction is not overlapped with the GEMM. `asynctp` = torch async-TP fused_matmul_reduce_scatter + RMSNorm on own rows + NCCL all-gather. `nccl` = dist.all_reduce + eager RMSNorm.
 
 ## back-to-back: ms (exposed %)
 
-| M | 1-GPU | ideal | ctapp | ctapp_graph | ctapp_nowait | multimem | asynctp | nccl | best ctapp vs best baseline (gain = 1 - ctapp / best baseline) |
-|---|---|---|---|---|---|---|---|---|---|
-| 1024 | 0.981 | 0.245 | 0.344 (29%) | 0.359 (32%) | 0.299 (18%) | 0.452 (46%) | 0.609 (60%) | 0.477 (49%) | ctapp 0.344 vs multimem 0.452: 24 % |
-| 2048 | 2.078 | 0.519 | 0.591 (12%) | 0.638 (19%) | 0.520 (0%) | 0.880 (41%) | 0.663 (22%) | 0.908 (43%) | ctapp 0.591 vs asynctp 0.663: 11 % |
-| 4096 | 4.113 | 1.028 | 1.070 (4%) | 1.149 (11%) | 0.931 (-10%) | 1.715 (40%) | 1.280 (20%) | 1.762 (42%) | ctapp 1.070 vs asynctp 1.280: 16 % |
-| 8192 | 8.189 | 2.047 | 2.284 (10%) | 2.360 (13%) | 1.993 (-3%) | 3.409 (40%) | 2.534 (19%) | 3.476 (41%) | ctapp 2.284 vs asynctp 2.534: 10 % |
-| 16384 | 16.946 | 4.237 | 4.764 (11%) | 5.045 (16%) | 4.272 (1%) | 6.748 (37%) | 5.016 (16%) | 6.881 (38%) | ctapp 4.764 vs asynctp 5.016: 5 % |
+| M | 1-GPU | ideal | ctapp | ctapp_graph | ctapp_nowait | multimem | flashinfer | asynctp | nccl | best ctapp vs best baseline (gain = 1 - ctapp / best baseline) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1024 | 0.983 | 0.246 | 0.344 (29%) | 0.360 (32%) | 0.300 (18%) | 0.452 (46%) | 0.344 (28%) | 1.023 (76%) | 0.477 (48%) | ctapp 0.344 vs flashinfer 0.344: -0 % |
+| 2048 | 2.049 | 0.512 | 0.590 (13%) | 0.637 (20%) | 0.522 (2%) | 0.878 (42%) | 0.658 (22%) | 0.662 (23%) | 0.910 (44%) | ctapp 0.590 vs flashinfer 0.658: 10 % |
+| 4096 | 4.113 | 1.028 | 1.053 (2%) | 1.155 (11%) | 0.936 (-10%) | 1.714 (40%) | 1.298 (21%) | 1.285 (20%) | 1.759 (42%) | ctapp 1.053 vs asynctp 1.285: 18 % |
+| 8192 | 8.183 | 2.046 | 2.236 (9%) | 2.377 (14%) | 1.996 (-2%) | 3.418 (40%) | 2.615 (22%) | 2.531 (19%) | 3.481 (41%) | ctapp 2.236 vs asynctp 2.531: 12 % |
+| 16384 | 16.992 | 4.248 | 4.754 (11%) | 5.049 (16%) | 4.254 (0%) | 6.760 (37%) | 5.240 (19%) | 5.022 (15%) | 6.925 (39%) | ctapp 4.754 vs asynctp 5.022: 5 % |
 
 ## per step: ms (exposed %)
 
-| M | 1-GPU | ideal | ctapp | ctapp_graph | ctapp_nowait | multimem | asynctp | nccl | best ctapp vs best baseline (gain = 1 - ctapp / best baseline) |
-|---|---|---|---|---|---|---|---|---|---|
-| 1024 | 0.981 | 0.245 | 0.462 (47%) | 0.414 (41%) | 0.318 (23%) | 0.541 (55%) | 0.838 (71%) | 0.542 (55%) | ctapp_graph 0.414 vs multimem 0.541: 23 % |
-| 2048 | 2.078 | 0.519 | 0.725 (28%) | 0.667 (22%) | 0.541 (4%) | 0.958 (46%) | 0.913 (43%) | 0.995 (48%) | ctapp_graph 0.667 vs asynctp 0.913: 27 % |
-| 4096 | 4.113 | 1.028 | 1.166 (12%) | 1.187 (13%) | 0.930 (-11%) | 1.805 (43%) | 1.577 (35%) | 1.857 (45%) | ctapp 1.166 vs asynctp 1.577: 26 % |
-| 8192 | 8.189 | 2.047 | 2.203 (7%) | 2.285 (10%) | 1.884 (-9%) | 3.472 (41%) | 2.699 (24%) | 3.532 (42%) | ctapp 2.203 vs asynctp 2.699: 18 % |
-| 16384 | 16.946 | 4.237 | 4.787 (12%) | 5.009 (15%) | 4.168 (-2%) | 6.798 (38%) | 5.098 (17%) | 6.917 (39%) | ctapp 4.787 vs asynctp 5.098: 6 % |
+| M | 1-GPU | ideal | ctapp | ctapp_graph | ctapp_nowait | multimem | flashinfer | asynctp | nccl | best ctapp vs best baseline (gain = 1 - ctapp / best baseline) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1024 | 0.983 | 0.246 | 0.467 (47%) | 0.422 (42%) | 0.325 (24%) | 0.526 (53%) | 0.424 (42%) | 1.077 (77%) | 0.567 (57%) | ctapp_graph 0.422 vs flashinfer 0.424: 0 % |
+| 2048 | 2.049 | 0.512 | 0.711 (28%) | 0.673 (24%) | 0.539 (5%) | 0.959 (47%) | 0.734 (30%) | 0.930 (45%) | 0.991 (48%) | ctapp_graph 0.673 vs flashinfer 0.734: 8 % |
+| 4096 | 4.113 | 1.028 | 1.191 (14%) | 1.178 (13%) | 0.927 (-11%) | 1.782 (42%) | 1.359 (24%) | 1.588 (35%) | 1.831 (44%) | ctapp_graph 1.178 vs flashinfer 1.359: 13 % |
+| 8192 | 8.183 | 2.046 | 2.206 (7%) | 2.282 (10%) | 1.899 (-8%) | 3.465 (41%) | 2.667 (23%) | 2.706 (24%) | 3.521 (42%) | ctapp 2.206 vs flashinfer 2.667: 17 % |
+| 16384 | 16.992 | 4.248 | 4.750 (11%) | 5.005 (15%) | 4.234 (-0%) | 6.795 (37%) | 5.328 (20%) | 5.133 (17%) | 6.950 (39%) | ctapp 4.750 vs asynctp 5.133: 7 % |
 
-rel err vs fp32 reference (max over M): ctapp 0.0046, ctapp_graph 0.0046, ctapp_nowait nan (not checked), multimem 0.0051, asynctp 0.0051, nccl 0.0053
+rel err vs fp32 reference (max over M): ctapp 0.0046, ctapp_graph 0.0046, ctapp_nowait nan (not checked), multimem 0.0051, flashinfer 0.0049, asynctp 0.0051, nccl 0.0053
 
 ## Reading the table
 
-- The gain over the best baseline (gain = 1 - ctapp / best baseline, back-to-back) is 24 % at 1k, 11 % at 2k, 16 % at 4k, 10 % at 8k and 5 % at 16k. At 2k the baseline is async-TP at 0.663 ms here (11 %); against multimem it is 33 %, and against the 0.867 ms async-TP of Step 0's `results/tp_strong.md` it is 32 %.
+- The gain over the best baseline (gain = 1 - ctapp / best baseline, back-to-back) is 0 % at 1k (tie with FlashInfer, 0.344 ms each), 10 % at 2k, 18 % at 4k, 12 % at 8k and 5 % at 16k. The best baseline is FlashInfer at 1k-2k and async-TP from 4k up; against multimem alone the gain is 24 % at 1k and 33 % at 2k.
+- FlashInfer's fused all-reduce + residual + RMSNorm lands between multimem and async-TP: at 1k it is 24 % faster than multimem and matches ctapp (b2b), at 2k it ties async-TP (0.658 vs 0.662 ms), and from 4k up it is 1-4 % slower than async-TP (22 % vs 19-20 % exposed at 4k-8k, 19 % vs 15 % at 16k) but 22-25 % faster than multimem. Its per-step times are the best baseline at 1k-8k (async-TP is 0.93-1.08 ms at 1k-2k per step; async-TP at 1k is also unstable between runs, 0.609 ms b2b in the earlier run vs 1.023 ms here).
 - The remaining gap to the `ctapp_nowait` floor is the R SMs lent to the reducer plus a ~10 % GEMM slowdown from multimem traffic landing in the GEMM GPU.
 - The graph variant wins per-step at M <= 2k (host launch overhead) and loses b2b everywhere because the timed region includes copying the inputs into static buffers (a production integration would capture against caller-owned buffers).
-- The gate from PLAN.md (>= 10 % over async-TP at 4k/8k, >= 20 % over multimem at 1k-2k) is met at 1k (24 % vs multimem), 4k (16 %) and 8k (10 %, marginal); at 2k it is met vs multimem (33 %) and marginal vs async-TP (11 %).
+- The gate from PLAN.md (>= 10 % over async-TP at 4k/8k, >= 20 % over multimem at 1k-2k) is met at 1k (24 % vs multimem), 2k (33 % vs multimem, 11 % vs async-TP), 4k (18 % vs async-TP) and 8k (12 %). The FlashInfer production baseline was added after the gate was written; against it the gain is 0 % at 1k, 10 % at 2k, 19 % at 4k, 14 % at 8k and 9 % at 16k.
 
 ## Reproduce
 

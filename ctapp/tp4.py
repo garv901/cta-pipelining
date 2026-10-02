@@ -50,6 +50,12 @@ def rmsnorm_gamma(x, gamma):
     return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + EPS)).to(x.dtype) * gamma
 
 
+def fold_gamma(Wq, gamma):
+    """RMSNorm gamma folded into the QKV weight columns: (Wq * gamma[None, :]) in fp32, rounded to bf16, contiguous.
+    Same arithmetic as ``shard_weights`` (fold before sharding or after: rows are independent)."""
+    return (Wq.float() * gamma.float()[None, :]).to(DTYPE).contiguous()
+
+
 # --------------------------------------------------------------------------- CTA-pipelined boundary
 class CtappBoundary:
     """Production CTA-pipelined boundary (Phase-4 decisions).
@@ -66,25 +72,31 @@ class CtappBoundary:
     protocol=False: mode-0 GEMMs with the same SM split and rasters, no reducer / waits / residual (raw two-GEMM floor).
     """
 
-    def __init__(self, M, Kr, N2r, rank, world, group_name, device, resid=True, protocol=True, use_graph=False, R=None):
+    def __init__(self, M, Kr, N2r, rank, world, group_name, device, resid=True, protocol=True, use_graph=False, R=None,
+                 qkv_raster=2, qkv_swizzle=1):
         from ctapp.ext import load_tp4
         assert N1 == 8192 and M % 128 == 0, (N1, M)
         self.ext = load_tp4()
         self.M, self.Kr, self.N2r, self.rank, self.world = M, Kr, N2r, rank, world
         self.dev, self.use_resid, self.protocol, self.use_graph = device, resid, protocol, use_graph
         self.R = R or (12 if M <= 2048 else 8)
+        self.qkv_raster, self.qkv_swizzle = qkv_raster, qkv_swizzle
         self.sms = torch.cuda.get_device_properties(device).multi_processor_count - self.R
         gn = group_name
         self.partials, h1 = _symm((M, N1), DTYPE, device, gn)
         self.xbuf, h2 = _symm((M, N1), DTYPE, device, gn)
+        self.xbuf1, h2b = _symm((M, N1), DTYPE, device, gn)   # second x buffer: x double-buffered by epoch parity
         self.tile_cnt, h3 = _symm((M // 128 * (N1 // 256),), torch.int32, device, gn)
         self.panel_cnt, h4 = _symm((M // 128,), torch.int32, device, gn)
         self.rowss, h5 = _symm((2, M), torch.float32, device, gn)
-        for h, t in ((h1, self.partials), (h2, self.xbuf), (h3, self.tile_cnt), (h4, self.panel_cnt), (h5, self.rowss)):
+        for h, t in ((h1, self.partials), (h2, self.xbuf), (h2b, self.xbuf1), (h3, self.tile_cnt), (h4, self.panel_cnt), (h5, self.rowss)):
             assert t.data_ptr() == h.buffer_ptrs[rank]
-        self.partials_mc, self.x_mc, self.tile_mc = h1.multicast_ptr, h2.multicast_ptr, h3.multicast_ptr
+        self.partials_mc, self.tile_mc = h1.multicast_ptr, h3.multicast_ptr
+        self.xbufs, self.x_mcs = [self.xbuf, self.xbuf1], [h2.multicast_ptr, h2b.multicast_ptr]
+        self.x_mc = self.x_mcs[0]
+        self._last_par = 0
         self.panel_mc, self.rowss_mc = h4.multicast_ptr, h5.multicast_ptr
-        self._hdls = (h1, h2, h3, h4, h5)
+        self._hdls = (h1, h2, h2b, h3, h4, h5)
         for t in (self.tile_cnt, self.panel_cnt, self.rowss):
             t.zero_()
         self.epoch_dev = torch.zeros(1, dtype=torch.int32, device=device)
@@ -99,48 +111,76 @@ class CtappBoundary:
         self.resid_static = torch.empty(M, N1, dtype=DTYPE, device=device) if use_graph and resid else None
         self._graphs = {}
         self._warm = False
+        self._warmed = False
 
-    def set_weights(self, Wdown_r, Wqkv_r_folded):
-        assert Wdown_r.shape == (N1, self.Kr) and Wqkv_r_folded.shape == (self.N2r, N1)
-        self.Wd, self.Wq = Wdown_r.contiguous(), Wqkv_r_folded.contiguous()
-        # Force lazy CUDA module loading of both GEMM kernels now. If the first launch of a GEMM happens while the (spinning)
-        # reducer kernel already occupies SMs, the run faults (spin-limit trap) on every rank.
+    def warmup(self):
+        """Force lazy CUDA module loading of both GEMM kernels (mode-0 launches on zeros), once per instance. If the first
+        launch of a GEMM happens while the (spinning) reducer kernel already occupies SMs, the run faults (spin-limit trap)
+        on every rank. Needs no real weights (dummy zero weights are used)."""
+        if self._warmed:
+            return
         e = self.ext
         hz = torch.zeros(self.M, self.Kr, dtype=DTYPE, device=self.dev)
-        e.tp4_down(hz, self.Wd, self.partials, 1, 1, 0, self.rank, self.world, 0, self.tile_mc, self.tile_cnt,
+        wd = torch.zeros(N1, self.Kr, dtype=DTYPE, device=self.dev)
+        wq = torch.zeros(self.N2r, N1, dtype=DTYPE, device=self.dev)
+        e.tp4_down(hz, wd, self.partials, 1, 1, 0, self.rank, self.world, 0, self.tile_mc, self.tile_cnt,
                    self.partials_mc, self.x_mc, None, self.rowss_mc, self.panel_mc, sms=self.sms)
-        e.tp4_qkv(self.xbuf, self.Wq, self.out, 2, 1, 0, 0, self.panel_cnt, 32 * self.world, self.rowss[0], sms=self.sms)
+        e.tp4_qkv(self.xbuf, wq, self.out, self.qkv_raster, self.qkv_swizzle, 0, 0, self.panel_cnt, 32 * self.world, self.rowss[0], sms=self.sms)
         torch.cuda.synchronize(self.dev)
+        self._warmed = True
 
-    def _enqueue(self, h_r, resid, parity):
+    def _check_w(self, Wd, Wq):
+        assert Wd.shape == (N1, self.Kr) and Wd.dtype == DTYPE and Wd.is_contiguous(), (Wd.shape, Wd.dtype)
+        assert Wq.shape == (self.N2r, N1) and Wq.dtype == DTYPE and Wq.is_contiguous(), (Wq.shape, Wq.dtype)
+
+    def set_weights(self, Wdown_r, Wqkv_r_folded):
+        """Default weights (used when forward() gets none; baked into the graphs when use_graph). Also runs warmup()."""
+        self._check_w(Wdown_r, Wqkv_r_folded)
+        self.Wd, self.Wq = Wdown_r, Wqkv_r_folded
+        self.warmup()
+
+    def _enqueue(self, h_r, resid, parity, Wd, Wq):
         e = self.ext
         if not self.protocol:
-            e.tp4_down(h_r, self.Wd, self.partials, 1, 1, 0, self.rank, self.world, 0, self.tile_mc, self.tile_cnt,
-                       self.partials_mc, self.x_mc, None, self.rowss_mc, self.panel_mc, sms=self.sms)
-            e.tp4_qkv(self.xbuf, self.Wq, self.out, 2, 1, 0, 0, self.panel_cnt, 32 * self.world, self.rowss[0], sms=self.sms)
+            e.tp4_down(h_r, Wd, self.partials, 1, 1, 0, self.rank, self.world, 0, self.tile_mc, self.tile_cnt,
+                       self.partials_mc, self.x_mcs[0], None, self.rowss_mc, self.panel_mc, sms=self.sms)
+            e.tp4_qkv(self.xbufs[0], Wq, self.out, self.qkv_raster, self.qkv_swizzle, 0, 0, self.panel_cnt, 32 * self.world, self.rowss[0], sms=self.sms)
             return
         cur = torch.cuda.current_stream()
+        xb, xm = self.xbufs[parity], self.x_mcs[parity]
         self.epoch_dev.add_(1)
         self.rowss[parity].zero_()
         self.ev_start.record(cur)
         self.s_red.wait_event(self.ev_start)
         with torch.cuda.stream(self.s_red):
-            e.tp4_reduce(self.M, self.rank, self.world, 0, 1, self.R, self.tile_cnt, self.partials_mc, self.x_mc, resid,
+            e.tp4_reduce(self.M, self.rank, self.world, 0, 1, self.R, self.tile_cnt, self.partials_mc, xm, resid,
                          self.rowss_mc + parity * self.M * 4, self.panel_mc, version=3, epoch_dev=self.epoch_dev)
             self.ev_red.record(self.s_red)
-        e.tp4_down(h_r, self.Wd, self.partials, 1, 1, 4, self.rank, self.world, 0, self.tile_mc, self.tile_cnt,
-                   self.partials_mc, self.x_mc, None, self.rowss_mc + parity * self.M * 4, self.panel_mc,
+        e.tp4_down(h_r, Wd, self.partials, 1, 1, 4, self.rank, self.world, 0, self.tile_mc, self.tile_cnt,
+                   self.partials_mc, xm, None, self.rowss_mc + parity * self.M * 4, self.panel_mc,
                    sms=self.sms, epoch_dev=self.epoch_dev)
-        e.tp4_qkv(self.xbuf, self.Wq, self.out, 2, 1, 2, 0, self.panel_cnt, 32 * self.world, self.rowss[parity],
+        e.tp4_qkv(xb, Wq, self.out, self.qkv_raster, self.qkv_swizzle, 2, 0, self.panel_cnt, 32 * self.world, self.rowss[parity],
                   sms=self.sms, epoch_dev=self.epoch_dev)
         cur.wait_event(self.ev_red)
 
-    def forward(self, h_r, resid=None):
+    def forward(self, h_r, resid=None, Wd=None, Wq=None):
+        """Wd (8192, Kr) / Wq (N2r, 8192, gamma folded): bf16 contiguous weights for this call (no copy; must stay alive
+        until the stream work finishes); default = those from set_weights. Not supported with use_graph."""
+        if self.use_graph:
+            assert Wd is None and Wq is None, "per-call weights are not supported with use_graph"
+        Wd = self.Wd if Wd is None else Wd
+        Wq = self.Wq if Wq is None else Wq
+        assert Wd is not None and Wq is not None, "no weights: call set_weights() or pass Wd/Wq"
+        self._check_w(Wd, Wq)
+        self.warmup()
         r = resid if self.use_resid else None
         self.epoch += 1
         par = self.epoch & 1
+        self._last_par = par
+        if r is not None:
+            assert r.data_ptr() != self.xbufs[par].data_ptr(), "resid aliases the x buffer written by this forward"
         if not self.use_graph:
-            self._enqueue(h_r, r, par)
+            self._enqueue(h_r, r, par, Wd, Wq)
             return self.out
         self.h_static.copy_(h_r)
         if r is not None:
@@ -148,20 +188,53 @@ class CtappBoundary:
         rs = self.resid_static if r is not None else None
         if not self._warm:               # un-captured warm-up; it is a real forward (device epoch advances with host epoch)
             self._warm = True
-            self._enqueue(self.h_static, rs, par)
+            self._enqueue(self.h_static, rs, par, Wd, Wq)
             return self.out
         g = self._graphs.get(par)
         if g is None:
             torch.cuda.synchronize(self.dev)
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
-                self._enqueue(self.h_static, rs, par)
+                self._enqueue(self.h_static, rs, par, Wd, Wq)
             self._graphs[par] = g
         g.replay()
         return self.out
 
     def x(self):
-        return self.xbuf
+        """New residual (M, 8192) of the most recent forward; valid until two forwards later (x is double-buffered)."""
+        return self.xbufs[self._last_par]
+
+
+class CtappBoundaryPool:
+    """One CtappBoundary per exact token count M, shared by all layers (weights are passed per forward call).
+
+    ``get(M)`` returns None when M is unsupported (M % 128 != 0 or M < min_M): the caller uses its stock path. Otherwise it
+    returns the cached instance for that M, creating it lazily. Creation is COLLECTIVE (symmetric-memory rendezvous +
+    barrier): every rank must call ``get`` with the same M in the same order. Instances share nothing and are never evicted;
+    requesting more than ``max_instances`` distinct M raises RuntimeError. Memory per instance: 2*M*8192*2 B symmetric
+    (partials + xbuf) + M*N2r*2 B (out) + small counters. warmup() runs on creation.
+    """
+
+    def __init__(self, Kr, N2r, rank, world, group_name, device, R=None, min_M=512, max_instances=4,
+                 qkv_raster=2, qkv_swizzle=1):
+        self.Kr, self.N2r, self.rank, self.world, self.gn, self.dev = Kr, N2r, rank, world, group_name, device
+        self.R, self.min_M, self.max_instances = R, min_M, max_instances
+        self.qkv_raster, self.qkv_swizzle = qkv_raster, qkv_swizzle
+        self._inst = {}
+
+    def get(self, M):
+        if M % 128 != 0 or M < self.min_M:
+            return None
+        bd = self._inst.get(M)
+        if bd is None:
+            if len(self._inst) >= self.max_instances:
+                raise RuntimeError(f"CtappBoundaryPool: more than {self.max_instances} distinct M requested (have "
+                                   f"{sorted(self._inst)}, asked {M})")
+            bd = CtappBoundary(M, self.Kr, self.N2r, self.rank, self.world, self.gn, self.dev, R=self.R,
+                              qkv_raster=self.qkv_raster, qkv_swizzle=self.qkv_swizzle)
+            bd.warmup()
+            self._inst[M] = bd
+        return bd
 
 
 # --------------------------------------------------------------------------- baselines
@@ -190,6 +263,44 @@ class MultimemBoundary(_Base):
         torch.mm(h_r, self.Wd.t(), out=self.y)
         torch.ops.symm_mem.multimem_all_reduce_(self.y, "sum", self.gn)
         return self._post(self.y, resid)
+
+
+class FlashInferBoundary(_Base):
+    """FlashInfer trtllm_allreduce_fusion (vLLM/TRT-LLM production path): one kernel does all-reduce + residual add
+    + RMSNorm and writes the new residual. Reduction is NOT overlapped with the GEMM."""
+
+    def __init__(self, *a, use_oneshot=None):
+        super().__init__(*a)
+        from flashinfer.comm import trtllm_create_ipc_workspace_for_all_reduce_fusion as create
+        self.use_oneshot = use_oneshot
+        self.ipc, self.ws = create(self.rank, self.world, self.M, N1, group=dist.group.WORLD)
+        self.y = torch.empty(self.M, N1, dtype=DTYPE, device=self.dev)
+        self.resid_out = torch.empty(self.M, N1, dtype=DTYPE, device=self.dev)
+        self.norm_out = torch.empty(self.M, N1, dtype=DTYPE, device=self.dev)
+        self.zeros = None
+        self.gamma_bf16 = self.gamma.contiguous()
+
+    def forward(self, h_r, resid=None):
+        from flashinfer.comm import trtllm_allreduce_fusion, AllReduceFusionPattern
+        if resid is None:
+            if self.zeros is None:
+                self.zeros = torch.zeros(self.M, N1, dtype=DTYPE, device=self.dev)
+            resid = self.zeros
+        torch.mm(h_r, self.Wd.t(), out=self.y)
+        trtllm_allreduce_fusion(
+            allreduce_in=self.y, world_size=self.world, world_rank=self.rank, token_num=self.M, hidden_dim=N1,
+            workspace_ptrs=self.ws, launch_with_pdl=False, trigger_completion_at_end=True, fp32_acc=True,
+            pattern_code=AllReduceFusionPattern.kARResidualRMSNorm, use_oneshot=self.use_oneshot,
+            allreduce_out=None, residual_in=resid, residual_out=self.resid_out, norm_out=self.norm_out,
+            quant_out=None, scale_out=None, rms_gamma=self.gamma_bf16, rms_eps=EPS, scale_factor=None, layout_code=None)
+        self._x = self.resid_out
+        return torch.mm(self.norm_out, self.Wq.t())
+
+    def destroy(self):
+        from flashinfer.comm import trtllm_destroy_ipc_workspace_for_all_reduce_fusion as destroy
+        torch.cuda.synchronize(self.dev)
+        dist.barrier()
+        destroy(self.ipc)
 
 
 class AsyncTpBoundary(_Base):

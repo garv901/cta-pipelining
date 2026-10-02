@@ -3,7 +3,7 @@
     python bench/tp4_bench.py --world 4 --tokens 1024,2048,4096,8192,16384 --iters 30 --warmup 5 --json build/tp4_4.json
 
 Per M: one_gpu = eager bf16 chain on rank 0, ideal = one_gpu / world. Methods: ctapp (eager launches), ctapp_graph (CUDA graph
-replay, one graph per epoch parity), ctapp_nowait (mode-0 GEMMs only: the raw two-GEMM floor), multimem, asynctp, nccl. Times: per-step (barrier+sync each call, median) and back-to-back (mean),
+replay, one graph per epoch parity), ctapp_nowait (mode-0 GEMMs only: the raw two-GEMM floor), multimem, flashinfer (fused AR+resid+RMSNorm), asynctp, nccl. Times: per-step (barrier+sync each call, median) and back-to-back (mean),
 both max over ranks. exposed % = (t - ideal) / t.
 """
 from __future__ import annotations
@@ -20,9 +20,9 @@ import torch.distributed as dist  # noqa: E402
 
 from ctapp import tp4  # noqa: E402
 
-METHODS = ["ctapp", "ctapp_graph", "ctapp_nowait", "multimem", "asynctp", "nccl"]
+METHODS = ["ctapp", "ctapp_graph", "ctapp_nowait", "multimem", "flashinfer", "asynctp", "nccl"]
 CTAPP = ("ctapp", "ctapp_graph")
-BASE = ("multimem", "asynctp", "nccl")
+BASE = ("multimem", "flashinfer", "asynctp", "nccl")
 
 
 def worker(rank, world, dev, gn, tokens, iters, warmup):
@@ -50,7 +50,7 @@ def worker(rank, world, dev, gn, tokens, iters, warmup):
                                           use_graph=(name == "ctapp_graph"))
                     b.set_weights(Wd_r, Wqf_r)
                 else:
-                    cls = {"multimem": tp4.MultimemBoundary, "asynctp": tp4.AsyncTpBoundary, "nccl": tp4.NcclBoundary}[name]
+                    cls = {"multimem": tp4.MultimemBoundary, "flashinfer": tp4.FlashInferBoundary, "asynctp": tp4.AsyncTpBoundary, "nccl": tp4.NcclBoundary}[name]
                     b = cls(M, rank, world, gn, dev, Wd_r, Wq_r, gamma)
                 y = b.forward(h_r, resid)
                 if name == "ctapp_graph":   # check the replayed graphs (parity 0 and 1), not only the un-captured warm-up call
@@ -64,6 +64,8 @@ def worker(rank, world, dev, gn, tokens, iters, warmup):
                 out[M][name] = {"per_step": ps, "b2b": bb, "rel_err": e.item()}
                 if rank == 0:
                     print(f"M={M:6d} {name:13s} per-step {ps:8.3f}  b2b {bb:8.3f} ms  out rel err {e.item():.2e}", flush=True)
+                if hasattr(b, "destroy"):
+                    b.destroy()
                 del b, y
             except Exception as ex:  # noqa: BLE001
                 out[M][name] = {"per_step": float("nan"), "b2b": float("nan"), "rel_err": float("nan")}
